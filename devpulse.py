@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""
+DevPulse CLI (devpulse.py) - Command-line interface for SecretBridge.
+Part of the offline developer utilities suite.
+
+Provides commands:
+  - keygen: Generate personal Curve25519 keypair
+  - fingerprint: View or verify a public key fingerprint
+  - send: Encrypt and package a .env file for chat transmission
+  - open: Decrypt an incoming SecretBridge token
+  - selftest: Run an automated verification cycle with dummy keys
+"""
+
+import sys
+import os
+import argparse
+import getpass
+import tempfile
+from pathlib import Path
+from typing import Optional
+
+import secret
+
+
+def format_error(msg: str) -> None:
+    sys.stderr.write(f"\n[DevPulse Error] {msg}\n\n")
+
+
+def cmd_keygen(args: argparse.Namespace) -> int:
+    try:
+        pub_str, fingerprint, priv_path, pub_path = secret.generate_keypair(
+            name=args.name,
+            force=args.force
+        )
+        print("=" * 60)
+        print(" DevPulse Keypair Generated Successfully")
+        print("=" * 60)
+        print(f"Name / Identity   : {args.name}")
+        print(f"Private Key File  : {priv_path} (mode 600 - keep safe!)")
+        print(f"Public Key File   : {pub_path}")
+        print(f"Public Fingerprint: {fingerprint}")
+        print("\nShare this single-line public key with your teammates:")
+        print(pub_str)
+        print("=" * 60)
+        return 0
+    except secret.SecretBridgeError as e:
+        format_error(str(e))
+        return 1
+    except Exception as e:
+        format_error(f"Failed to generate keys: {e}")
+        return 1
+
+
+def cmd_fingerprint(args: argparse.Namespace) -> int:
+    try:
+        if args.key:
+            _, fingerprint = secret.parse_public_key_input(args.key)
+            print(f"Key Fingerprint: {fingerprint}")
+            print("(Compare this fingerprint with your friend over a voice call or in person)")
+        else:
+            _, fingerprint = secret.load_own_public_key()
+            config_dir = secret.get_config_dir()
+            print(f"Your Public Key Fingerprint: {fingerprint}")
+            print(f"Config Directory: {config_dir}")
+        return 0
+    except secret.SecretBridgeError as e:
+        format_error(str(e))
+        return 1
+    except Exception as e:
+        format_error(f"Could not compute fingerprint: {e}")
+        return 1
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    file_path = Path(args.file)
+    sender_name = secret.load_sender_name()
+
+    if args.expires_hours is not None and args.expires_hours <= 0:
+        format_error("--expires-hours must be a positive number (e.g. 1 or 0.5).")
+        return 1
+
+    try:
+        payload_bytes = secret.build_payload(
+            file_path=file_path,
+            sender_name=sender_name,
+            expires_hours=args.expires_hours
+        )
+
+        if args.passphrase:
+            print(f"Encrypting '{file_path.name}' with passphrase protection...")
+            pw1 = getpass.getpass("Enter secret passphrase: ")
+            if not pw1:
+                format_error("Passphrase cannot be empty.")
+                return 1
+            pw2 = getpass.getpass("Confirm secret passphrase: ")
+            if pw1 != pw2:
+                format_error("Passphrases do not match. Aborted.")
+                return 1
+
+            token = secret.encrypt_with_passphrase(payload_bytes, pw1)
+            print("\n" + "=" * 60)
+            print(" SecretBridge Token (Passphrase-Protected):")
+            print("=" * 60)
+            print(token)
+            print("=" * 60)
+            print("\n[!] IMPORTANT: Share the passphrase over a separate secure channel")
+            print("    (e.g., via a quick phone call), NEVER in the same chat as this token!")
+            if args.expires_hours:
+                print(f"    This message will expire in {args.expires_hours} hour(s).")
+            print()
+            return 0
+
+        elif args.to:
+            recipient_pub, recipient_fp = secret.parse_public_key_input(args.to)
+            token = secret.encrypt_for_public_key(payload_bytes, recipient_pub)
+
+            print("\n" + "=" * 60)
+            print(" SecretBridge Token (Public-Key Encrypted):")
+            print("=" * 60)
+            print(token)
+            print("=" * 60)
+            print(f"\nRecipient Key Fingerprint: {recipient_fp}")
+            print("Confirm this matches what your friend sees on their device.")
+            if args.expires_hours:
+                print(f"This message will expire in {args.expires_hours} hour(s).")
+            print()
+            return 0
+
+        else:
+            format_error("You must specify either --to <recipient_key> or --passphrase.")
+            return 1
+
+    except secret.SecretBridgeError as e:
+        format_error(str(e))
+        return 1
+    except Exception as e:
+        format_error(f"Encryption failed: {e}")
+        return 1
+
+
+def cmd_open(args: argparse.Namespace) -> int:
+    token = args.text
+
+    if not token:
+        if not sys.stdin.isatty():
+            token = sys.stdin.read().strip()
+        else:
+            try:
+                token = input("Paste SecretBridge token (DEVPULSE-v1:... or DEVPULSE-v1P:...): ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\nOperation cancelled.")
+                return 1
+
+    if not token:
+        format_error("No message token was provided.")
+        return 1
+
+    passphrase = None
+    if token.startswith(secret.CIPHERTEXT_PASSPHRASE_PREFIX):
+        try:
+            passphrase = getpass.getpass("Enter decryption passphrase: ")
+        except (KeyboardInterrupt, EOFError):
+            print("\nOperation cancelled.")
+            return 1
+
+    try:
+        payload = secret.decrypt_message(token, passphrase=passphrase)
+
+        sender = payload.get("sender_name", "Anonymous")
+        created = payload.get("created_at", "Unknown")
+        orig_filename = payload.get("filename", "unnamed.env")
+
+        print("\n" + "-" * 50)
+        print(f"Sender Identity : {sender} (NOTE: Not cryptographically verified)")
+        print(f"Created At      : {created} (UTC)")
+        print(f"Original Name   : {orig_filename}")
+        print("-" * 50)
+
+        if args.print:
+            raw_b64 = payload.get("file_content_b64", "")
+            import base64
+            content = base64.b64decode(raw_b64).decode("utf-8", errors="replace")
+            print("\n--- BEGIN FILE CONTENT ---")
+            print(content, end="")
+            if not content.endswith("\n"):
+                print()
+            print("--- END FILE CONTENT ---\n")
+            return 0
+        else:
+            out_path = Path(args.out) if args.out else None
+            saved_path, _ = secret.write_decrypted_file(payload, out_path=out_path, force=args.force)
+            print(f"[+] Successfully decrypted and saved to: {saved_path}")
+            print("    File permissions set to 600 (owner read/write only).")
+            print()
+            return 0
+
+    except secret.SecretBridgeError as e:
+        format_error(str(e))
+        return 1
+    except Exception as e:
+        format_error(f"Decryption failed: {e}")
+        return 1
+
+
+def cmd_selftest(args: argparse.Namespace) -> int:
+    print("=" * 60)
+    print(" Running DevPulse / SecretBridge Self-Test Suite...")
+    print("=" * 60)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        alice_home = tmp_path / "alice_config"
+        bob_home = tmp_path / "bob_config"
+        work_dir = tmp_path / "workspace"
+        work_dir.mkdir()
+
+        dummy_env = work_dir / ".env.test"
+        dummy_content = (
+            b"# Dummy configuration for SecretBridge selftest\n"
+            b"API_KEY=not-a-real-key-1234567890\n"
+            b"DATABASE_URL=postgresql://dummy_user:dummy_pass@localhost:5432/testdb\n"
+            b"JWT_SECRET=super_secret_local_test_key\n"
+        )
+        dummy_env.write_bytes(dummy_content)
+
+        tests_passed = 0
+        total_tests = 4
+
+        print("\n[Test 1/4] Key Generation & Permissions Check...")
+        try:
+            alice_pub, alice_fp, _, _ = secret.generate_keypair("Alice", config_dir=alice_home)
+            bob_pub, bob_fp, _, _ = secret.generate_keypair("Bob", config_dir=bob_home)
+
+            assert (alice_home / "private.key").stat().st_mode & 0o777 == 0o600
+            assert (alice_home).stat().st_mode & 0o777 == 0o700
+            print(f"  Alice Fingerprint: {alice_fp}")
+            print(f"  Bob Fingerprint  : {bob_fp}")
+            print("  Result: PASS")
+            tests_passed += 1
+        except Exception as e:
+            print(f"  Result: FAIL ({e})")
+
+        print("\n[Test 2/4] Public-Key (SealedBox) Round-Trip...")
+        try:
+            payload = secret.build_payload(dummy_env, "Bob")
+            parsed_alice_pub, _ = secret.parse_public_key_input(alice_pub)
+            token = secret.encrypt_for_public_key(payload, parsed_alice_pub)
+
+            assert token.startswith("DEVPULSE-v1:")
+            decrypted_payload = secret.decrypt_message(token, config_dir=alice_home)
+            out_file = work_dir / "alice_received.env"
+            saved_path, content = secret.write_decrypted_file(decrypted_payload, out_path=out_file)
+
+            assert content == dummy_content
+            assert saved_path.stat().st_mode & 0o777 == 0o600
+            print("  Decrypted content matches dummy .env exactly byte-for-byte.")
+            print("  Result: PASS")
+            tests_passed += 1
+        except Exception as e:
+            print(f"  Result: FAIL ({e})")
+
+        print("\n[Test 3/4] Passphrase (Scrypt + SecretBox) Round-Trip...")
+        try:
+            test_pw = "correct-horse-battery-staple-42"
+            payload = secret.build_payload(dummy_env, "Alice")
+            p_token = secret.encrypt_with_passphrase(payload, test_pw)
+
+            assert p_token.startswith("DEVPULSE-v1P:")
+            decrypted_p = secret.decrypt_message(p_token, passphrase=test_pw)
+            out_pw_file = work_dir / "decrypted_pw.env"
+            _, content_pw = secret.write_decrypted_file(decrypted_p, out_path=out_pw_file)
+            assert content_pw == dummy_content
+
+            wrong_failed = False
+            try:
+                secret.decrypt_message(p_token, passphrase="wrong-passphrase")
+            except secret.DecryptionFailedError:
+                wrong_failed = True
+
+            assert wrong_failed, "Wrong passphrase did not raise DecryptionFailedError"
+            print("  Correct passphrase succeeded; incorrect passphrase properly rejected.")
+            print("  Result: PASS")
+            tests_passed += 1
+        except Exception as e:
+            print(f"  Result: FAIL ({e})")
+
+        print("\n[Test 4/4] Expiration Safety Check...")
+        try:
+            payload_expired = secret.build_payload(dummy_env, "Alice", expires_hours=-1.0)
+            exp_token = secret.encrypt_with_passphrase(payload_expired, "pw123")
+            expired_rejected = False
+            try:
+                secret.decrypt_message(exp_token, passphrase="pw123")
+            except secret.ExpiredMessageError:
+                expired_rejected = True
+
+            assert expired_rejected, "Expired message was not rejected"
+            print("  Expired message was correctly intercepted and refused.")
+            print("  Result: PASS")
+            tests_passed += 1
+        except Exception as e:
+            print(f"  Result: FAIL ({e})")
+
+    print("\n" + "=" * 60)
+    if tests_passed == total_tests:
+        print(f" SELF-TEST SUMMARY: ALL {total_tests}/{total_tests} TESTS PASSED [PASS]")
+        print(" SecretBridge is fully functioning and verified offline.")
+        print("=" * 60 + "\n")
+        return 0
+    else:
+        print(f" SELF-TEST SUMMARY: {tests_passed}/{total_tests} TESTS PASSED [FAIL]")
+        print("=" * 60 + "\n")
+        return 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="devpulse",
+        description="DevPulse / SecretBridge: Encrypt and share .env files securely over chat."
+    )
+
+    subparsers = parser.add_subparsers(dest="command", required=True, help="Available subcommands")
+
+    parser_keygen = subparsers.add_parser("keygen", help="Generate a new Curve25519 keypair")
+    parser_keygen.add_argument("--name", required=True, help="Your name or handle (e.g. Alice)")
+    parser_keygen.add_argument("--force", action="store_true", help="Overwrite existing keys")
+    parser_keygen.set_defaults(func=cmd_keygen)
+
+    parser_fp = subparsers.add_parser("fingerprint", help="Show public key fingerprint")
+    parser_fp.add_argument("--key", help="Public key string or file to inspect (default: own key)")
+    parser_fp.set_defaults(func=cmd_fingerprint)
+
+    parser_send = subparsers.add_parser("send", help="Encrypt a file for secure chat delivery")
+    parser_send.add_argument("file", help="Path to the .env or config file to encrypt (max 64 KB)")
+    send_mode = parser_send.add_mutually_exclusive_group(required=True)
+    send_mode.add_argument("--to", help="Recipient's public key string or path to public.key file")
+    send_mode.add_argument("--passphrase", action="store_true", help="Encrypt with a passphrase instead of a public key")
+    parser_send.add_argument("--expires-hours", type=float, default=None, help="Set message expiration in hours")
+    parser_send.set_defaults(func=cmd_send)
+
+    parser_open = subparsers.add_parser("open", help="Decrypt and view/save a received SecretBridge message")
+    parser_open.add_argument("--text", help="The raw DEVPULSE-v1:... or DEVPULSE-v1P:... message string")
+    parser_open.add_argument("--out", help="Custom destination filename (default: original filename)")
+    parser_open.add_argument("--print", action="store_true", help="Display content in terminal instead of saving to file")
+    parser_open.add_argument("--force", action="store_true", help="Overwrite existing file on disk")
+    parser_open.set_defaults(func=cmd_open)
+
+    parser_selftest = subparsers.add_parser("selftest", help="Run automated offline cryptographic test suite")
+    parser_selftest.set_defaults(func=cmd_selftest)
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        exit_code = args.func(args)
+        sys.exit(exit_code)
+    except KeyboardInterrupt:
+        print("\nOperation cancelled by user.")
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
