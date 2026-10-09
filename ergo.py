@@ -24,6 +24,7 @@ import time
 import shutil
 import sqlite3
 import threading
+import signal
 import subprocess
 from pathlib import Path
 from datetime import datetime, date
@@ -544,6 +545,7 @@ def run_ergo_start() -> None:
     Logs events to SQLite at ~/.config/devpulse/ergo.db.
     """
     config = load_ergo_config()
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     conn = init_db()
     done_flag_path = get_done_flag_path()
 

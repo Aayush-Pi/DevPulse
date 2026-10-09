@@ -2052,7 +2052,7 @@ class MainWindow(QMainWindow):
         if swayidle_bin:
             try:
                 import subprocess
-                subprocess.run(["pkill", "-f", "swayidle.*DevPulse"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["pkill", "-x", "swayidle"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception:
                 pass
 
