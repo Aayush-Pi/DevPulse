@@ -19,9 +19,10 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-# Import the core crypto logic from secret.py and focus logic from focus.py
+# Import the core modules for SecretBridge, FocusPulse, and ErgoGuard
 import secret
 import focus
+import ergo
 
 
 def format_error(msg: str) -> None:
@@ -280,6 +281,50 @@ def cmd_focus_selftest(args: argparse.Namespace) -> int:
 
 
 # ==============================================================================
+# Command Handlers: ergo (ErgoGuard subcommands)
+# ==============================================================================
+
+def cmd_ergo_start(args: argparse.Namespace) -> int:
+    """Starts the ErgoGuard break and rest monitoring daemon."""
+    try:
+        ergo.run_ergo_start()
+        return 0
+    except KeyboardInterrupt:
+        print("\nErgoGuard stopped.")
+        return 0
+    except Exception as e:
+        format_error(f"ErgoGuard encountered an error: {e}")
+        return 1
+
+
+def cmd_ergo_done(args: argparse.Namespace) -> int:
+    """Signals that a break was taken and resets break timers."""
+    try:
+        return ergo.run_ergo_done()
+    except Exception as e:
+        format_error(f"Failed to record completed break: {e}")
+        return 1
+
+
+def cmd_ergo_status(args: argparse.Namespace) -> int:
+    """Displays today's ergonomic break statistics and last break time."""
+    try:
+        return ergo.run_ergo_status()
+    except Exception as e:
+        format_error(f"Could not load ergonomic status: {e}")
+        return 1
+
+
+def cmd_ergo_selftest(args: argparse.Namespace) -> int:
+    """Runs the offline unit test suite for ErgoGuard break state logic."""
+    try:
+        return ergo.run_ergo_selftest()
+    except Exception as e:
+        format_error(f"ErgoGuard self-test failed to execute: {e}")
+        return 1
+
+
+# ==============================================================================
 # Command Handler: selftest
 # ==============================================================================
 
@@ -466,6 +511,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_focus_selftest = focus_subparsers.add_parser("selftest", help="Run offline unit tests for window classification rules")
     p_focus_selftest.set_defaults(func=cmd_focus_selftest)
+
+    # 7. ergo
+    parser_ergo = subparsers.add_parser("ergo", help="ErgoGuard ergonomic break, rest, and commit monitor")
+    ergo_subparsers = parser_ergo.add_subparsers(dest="ergo_command", required=True, help="ErgoGuard subcommands")
+
+    p_ergo_start = ergo_subparsers.add_parser("start", help="Start ergonomic break monitoring with idle detection")
+    p_ergo_start.set_defaults(func=cmd_ergo_start)
+
+    p_ergo_done = ergo_subparsers.add_parser("done", help="Acknowledge taking a break and reset break timers")
+    p_ergo_done.set_defaults(func=cmd_ergo_done)
+
+    p_ergo_status = ergo_subparsers.add_parser("status", help="Show today's break and rest event counts")
+    p_ergo_status.set_defaults(func=cmd_ergo_status)
+
+    p_ergo_selftest = ergo_subparsers.add_parser("selftest", help="Run offline unit tests for ergonomic break state logic")
+    p_ergo_selftest.set_defaults(func=cmd_ergo_selftest)
 
     return parser
 
