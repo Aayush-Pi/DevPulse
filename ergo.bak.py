@@ -759,32 +759,11 @@ def run_ergo_selftest() -> int:
       3. 'Show on pause' (natural pause triggering)
       4. 5-minute max wait timeout (break triggers even without pause)
       5. Max 3 notifications per hour cap
-    Uses a fixed in-memory configuration (20/45/90 min) so self-tests are
-    completely isolated from any user edits to ~/.config/devpulse/ergo.yaml.
     Prints PASS or FAIL per test and a final summary.
     """
     print("=" * 65)
     print(" Running DevPulse ErgoGuard Offline Logic Self-Test...")
     print("=" * 65)
-
-    # Fixed in-memory config so selftest never reads ~/.config/devpulse/ergo.yaml
-    test_config = {
-        "breaks": {
-            "eye": {
-                "interval_minutes": 20,
-                "message": "20-20-20: look at something 20 feet away for 20 seconds"
-            },
-            "stretch": {
-                "interval_minutes": 45,
-                "message": "Stand up and stretch your back and shoulders"
-            },
-            "walk": {
-                "interval_minutes": 90,
-                "message": "Walk around and drink some water"
-            }
-        },
-        "git_watch_dirs": []
-    }
 
     tests_passed = 0
     total_tests = 5
@@ -795,7 +774,7 @@ def run_ergo_selftest() -> int:
     print("\n[Test 1/5] Active-Time Counting (Active vs Idle)...")
     try:
         t0 = 1000.0
-        state = create_ergo_state(t0, config=test_config)
+        state = create_ergo_state(t0)
 
         # Advance 60 seconds while ACTIVE
         state, _ = update_ergo_tick(state, t0 + 60.0)
@@ -821,7 +800,7 @@ def run_ergo_selftest() -> int:
     print("\n[Test 2/5] Real Rest Reset after 5+ Minutes Idle...")
     try:
         t0 = 1000.0
-        state = create_ergo_state(t0, config=test_config)
+        state = create_ergo_state(t0)
         # Advance 18 minutes (1080s) active time
         state, _ = update_ergo_tick(state, t0 + 1080.0)
         assert state["active_seconds"] == 1080.0
@@ -851,7 +830,7 @@ def run_ergo_selftest() -> int:
     print("\n[Test 3/5] 'Show on Pause' (Natural Pause Triggering)...")
     try:
         t0 = 1000.0
-        state = create_ergo_state(t0, config=test_config)
+        state = create_ergo_state(t0)
 
         # Eye break interval is 20m (1200s). Advance 1205 seconds active.
         t_due = t0 + 1205.0
@@ -880,7 +859,7 @@ def run_ergo_selftest() -> int:
     print("\n[Test 4/5] 5-Minute Max Wait (Timeout Triggering)...")
     try:
         t0 = 1000.0
-        state = create_ergo_state(t0, config=test_config)
+        state = create_ergo_state(t0)
 
         # Eye break due at 1200s
         t_due = t0 + 1200.0
@@ -909,7 +888,7 @@ def run_ergo_selftest() -> int:
     print("\n[Test 5/5] Rate Limit Cap (Max 3 Notifications per Hour)...")
     try:
         t0 = 10000.0
-        state = create_ergo_state(t0, config=test_config)
+        state = create_ergo_state(t0)
 
         # Trigger 3 break notifications in the same hour
         for i in range(3):

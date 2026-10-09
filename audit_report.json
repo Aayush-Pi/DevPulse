@@ -1,23 +1,24 @@
 {
-  "report_generated_at": "2026-10-09T20:36:57.854347+00:00",
+  "report_generated_at": "2026-10-09T21:19:09.414836+00:00",
   "device_hostname": "perma",
   "devpulse_version": "0.1",
   "period": {
     "since_days": 7,
-    "start_timestamp": "2026-10-02T20:36:57.854347+00:00",
-    "end_timestamp": "2026-10-09T20:36:57.854347+00:00"
+    "start_timestamp": "2026-10-02T21:19:09.414836+00:00",
+    "end_timestamp": "2026-10-09T21:19:09.414836+00:00"
   },
   "secretbridge": {
     "by_event_type": {
-      "key_generated": 1,
-      "message_decrypted": 1,
-      "message_encrypted": 1
+      "decrypt_failed": 1,
+      "key_generated": 6,
+      "message_decrypted": 2,
+      "message_encrypted": 3
     },
     "by_mode": {
-      "none": 1,
-      "public_key": 5
+      "none": 6,
+      "public_key": 6
     },
-    "total_events": 3
+    "total_events": 12
   },
   "focuspulse": {
     "focus_seconds": 42.8,
@@ -57,5 +58,5 @@
   "privacy": {
     "statement": "No window titles, no keystrokes, no file contents, no cryptographic keys, and no personal data leave this computer. All metrics are computed locally from privacy-preserving event logs."
   },
-  "integrity": "1f3362b5e5755136b6fb3e2b2b4ebf831a316334e25d990f5b6db973d5a0909a"
+  "integrity": "278f7b122f0d1cbba54c5eedb191529ce6a114af1aef70326642cbdb6d6752e3"
 }

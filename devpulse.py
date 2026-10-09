@@ -110,6 +110,10 @@ def cmd_send(args: argparse.Namespace) -> int:
     file_path = Path(args.file)
     sender_name = secret.load_sender_name()
 
+    if args.expires_hours is not None and args.expires_hours <= 0:
+        format_error("--expires-hours must be a positive number (e.g. 1 or 0.5).")
+        return 1
+
     try:
         payload_bytes = secret.build_payload(
             file_path=file_path,

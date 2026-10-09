@@ -363,7 +363,7 @@ def build_payload(
 
     now_utc = datetime.now(timezone.utc)
     expires_utc_str = None
-    if expires_hours is not None and expires_hours > 0:
+    if expires_hours is not None:
         expires_dt = now_utc + timedelta(hours=expires_hours)
         expires_utc_str = expires_dt.isoformat()
 
@@ -576,6 +576,8 @@ def write_decrypted_file(
         f.write(content_bytes)
 
     return target_path, content_bytes
+
+
 def format_public_key(public_key) -> str:
     """Turn a public key into the shareable one-line DEVPULSE-PUB-v1:<base64> string."""
     return f"{PUBKEY_PREFIX}{base64.b64encode(bytes(public_key)).decode('ascii')}"

@@ -6,25 +6,29 @@ Part of DevPulse - An offline-first suite for developer workflows.
 ARCHITECTURE & DESIGN PRINCIPLES:
 1. THIN PRESENTATION LAYER:
    Contains ZERO cryptographic algorithms and ZERO tracking logic.
-   Directly calls verified functions from secret.py and audit.py.
+   Directly calls verified functions from secret.py, focus.py, ergo.py, and audit.py.
 2. 100% OFFLINE & NATIVE QT:
    Uses standard PyQt6 widgets and default platform styling (Breeze on KDE).
    No QtWebEngine, no matplotlib, no custom CSS theming.
-3. SANDBOXED CONSOLE PROCESS RUNNER:
-   Executes ONLY devpulse.py subcommands via QProcess. Rejects any arbitrary
-   shell commands to prevent shell injection or accidental commands.
-4. WAYLAND RESILIENT:
+3. REAL DATABASE INTROSPECTION:
+   Queries focus.db (focus_events, window_switches), audit.db (secret_events),
+   and introspects ergo.db with PRAGMA table_info rather than assuming schema.
+   Missing databases or empty tables show zeros gracefully without crashing.
+4. WAYLAND RESILIENT & CLEAN SHUTDOWN:
    Supports both drag-and-drop and standard Qt file selection dialogs.
+   Cleanly terminates background processes (including swayidle) on window close.
 ================================================================================
 """
 
 import sys
 import os
 import shlex
+import shutil
+import sqlite3
 import tempfile
 from pathlib import Path
-from datetime import datetime
-from typing import Optional, List
+from datetime import datetime, date
+from typing import Optional, List, Dict, Any, Tuple
 
 # Check PyQt6 availability with friendly guidance
 try:
@@ -33,7 +37,7 @@ try:
         QHBoxLayout, QSplitter, QTextEdit, QLineEdit, QPushButton,
         QLabel, QGroupBox, QFileDialog, QMessageBox, QDialog,
         QDialogButtonBox, QSpinBox, QRadioButton, QButtonGroup,
-        QScrollArea, QFrame
+        QScrollArea, QFrame, QProgressBar, QGridLayout
     )
     from PyQt6.QtCore import Qt, QProcess, pyqtSignal, QTimer
     from PyQt6.QtGui import QFont, QDragEnterEvent, QDropEvent
@@ -46,8 +50,16 @@ except ImportError:
     )
     sys.exit(1)
 
+# Check PyYAML availability
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
 # Import existing core modules (NO crypto or tracking logic re-implemented here)
 import secret
+import focus
+import ergo
 import audit
 
 
@@ -58,16 +70,205 @@ ALLOWED_SUBCOMMANDS = {
 
 
 # ==============================================================================
-# Helper Functions
+# Database Helper Functions (Tolerant & Privacy-Preserving)
+# ==============================================================================
+
+def get_today_focus_metrics() -> Dict[str, Any]:
+    """
+    Reads focus.db for today's metrics.
+    Tables: focus_events(timestamp, window_class, category, duration_seconds)
+            window_switches(timestamp, window_class)
+    Returns zeros if database is missing. Never crashes.
+    """
+    db_path = focus.get_db_path()
+    metrics = {
+        "focus_seconds": 0.0,
+        "distraction_seconds": 0.0,
+        "neutral_seconds": 0.0,
+        "total_seconds": 0.0,
+        "focus_score": 0.0,
+        "switch_count": 0
+    }
+    if not db_path.exists():
+        return metrics
+
+    today_iso = date.today().isoformat()
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=3.0)
+        cur = conn.cursor()
+
+        # Check existing tables
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = [row[0] for row in cur.fetchall()]
+
+        if "focus_events" in tables:
+            cur.execute("""
+                SELECT category, SUM(duration_seconds)
+                FROM focus_events
+                WHERE date(timestamp) = ?
+                GROUP BY category
+            """, (today_iso,))
+            for cat, dur in cur.fetchall():
+                val = float(dur) if dur else 0.0
+                if cat == "focus":
+                    metrics["focus_seconds"] = val
+                elif cat == "distraction":
+                    metrics["distraction_seconds"] = val
+                elif cat == "neutral":
+                    metrics["neutral_seconds"] = val
+
+        if "window_switches" in tables:
+            cur.execute("SELECT COUNT(*) FROM window_switches WHERE date(timestamp) = ?", (today_iso,))
+            row = cur.fetchone()
+            metrics["switch_count"] = row[0] if row else 0
+
+        conn.close()
+
+        total = metrics["focus_seconds"] + metrics["distraction_seconds"] + metrics["neutral_seconds"]
+        metrics["total_seconds"] = total
+        denom = metrics["focus_seconds"] + metrics["distraction_seconds"]
+        if denom > 0:
+            metrics["focus_score"] = round((metrics["focus_seconds"] / denom) * 100.0, 1)
+        else:
+            metrics["focus_score"] = 100.0 if total > 0 else 0.0
+
+    except Exception:
+        pass
+
+    return metrics
+
+
+def get_today_ergo_metrics() -> Dict[str, Any]:
+    """
+    Reads ergo.db by inspecting tables and columns via PRAGMA table_info.
+    Returns counts for today. Returns zeros if database is missing.
+    """
+    db_path = ergo.get_ergo_db_path()
+    metrics = {
+        "break_shown": 0,
+        "rest_detected": 0,
+        "commit_detected": 0,
+        "manual_done": 0,
+        "total_breaks": 0,
+        "active_minutes": 0,
+        "last_break_time": "None recorded today"
+    }
+
+    # Fetch active minutes from focus.db if available
+    focus_m = get_today_focus_metrics()
+    metrics["active_minutes"] = int(round(focus_m["total_seconds"] / 60.0))
+
+    if not db_path.exists():
+        return metrics
+
+    today_iso = date.today().isoformat()
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=3.0)
+        table_name, columns = audit.inspect_ergo_schema(conn)
+
+        if not table_name or "event_type" not in columns or "timestamp" not in columns:
+            conn.close()
+            return metrics
+
+        cur = conn.cursor()
+        cur.execute(f"""
+            SELECT event_type, COUNT(*)
+            FROM {table_name}
+            WHERE date(timestamp) = ?
+            GROUP BY event_type
+        """, (today_iso,))
+
+        for etype, cnt in cur.fetchall():
+            if etype in metrics:
+                metrics[etype] = cnt
+
+        metrics["total_breaks"] = metrics["break_shown"]
+
+        # If a dedicated active/duration column exists in ergo table schema, prioritize it
+        for col in ["duration_seconds", "active_seconds", "duration", "active_minutes"]:
+            if col in columns:
+                cur.execute(f"""
+                    SELECT SUM({col})
+                    FROM {table_name}
+                    WHERE date(timestamp) = ?
+                """, (today_iso,))
+                row = cur.fetchone()
+                if row and row[0]:
+                    if col == "active_minutes":
+                        metrics["active_minutes"] = int(round(row[0]))
+                    else:
+                        metrics["active_minutes"] = int(round(row[0] / 60.0))
+                break
+
+        # Last break timestamp
+        cur.execute(f"""
+            SELECT timestamp
+            FROM {table_name}
+            WHERE event_type = 'break_shown'
+            ORDER BY id DESC
+            LIMIT 1
+        """)
+        last_row = cur.fetchone()
+        if last_row and last_row[0]:
+            try:
+                dt = datetime.fromisoformat(last_row[0])
+                metrics["last_break_time"] = dt.strftime("%H:%M:%S")
+            except Exception:
+                metrics["last_break_time"] = str(last_row[0])
+
+        conn.close()
+    except Exception:
+        pass
+
+    return metrics
+
+
+def get_today_audit_metrics() -> Dict[str, int]:
+    """
+    Reads audit.db for SecretBridge operations today.
+    Table: secret_events(id, timestamp, event_type, mode)
+    Returns zeros if database is missing.
+    """
+    db_path = audit.get_audit_db_path()
+    metrics = {
+        "encrypted_today": 0,
+        "decrypted_today": 0,
+        "total_secret_events": 0
+    }
+    if not db_path.exists():
+        return metrics
+
+    today_iso = date.today().isoformat()
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=3.0)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT event_type, COUNT(*)
+            FROM secret_events
+            WHERE date(timestamp) = ?
+            GROUP BY event_type
+        """, (today_iso,))
+
+        for etype, cnt in cur.fetchall():
+            if etype == "message_encrypted":
+                metrics["encrypted_today"] = cnt
+            elif etype == "message_decrypted":
+                metrics["decrypted_today"] = cnt
+            metrics["total_secret_events"] += cnt
+
+        conn.close()
+    except Exception:
+        pass
+
+    return metrics
+
+
+# ==============================================================================
+# Helper Functions & Dialogs
 # ==============================================================================
 
 def mask_env_content(raw_text: str) -> str:
-    """
-    Masks secret values in a .env file while keeping variable names and comments visible.
-    Example:
-      DATABASE_URL=postgres://user:pass@localhost:5432/db -> DATABASE_URL=****
-      # Production Config -> # Production Config
-    """
+    """Masks secret values in a .env file while keeping variable names visible."""
     masked_lines = []
     for line in raw_text.splitlines():
         stripped = line.strip()
@@ -81,10 +282,6 @@ def mask_env_content(raw_text: str) -> str:
     return "\n".join(masked_lines)
 
 
-# ==============================================================================
-# Passphrase Entry Modal Dialog
-# ==============================================================================
-
 class PassphraseDialog(QDialog):
     """Modal dialog to securely enter and confirm a passphrase twice."""
 
@@ -94,7 +291,6 @@ class PassphraseDialog(QDialog):
         self.setMinimumWidth(360)
 
         layout = QVBoxLayout(self)
-
         layout.addWidget(QLabel("Passphrase:"))
         self.pass1_edit = QLineEdit(self)
         self.pass1_edit.setEchoMode(QLineEdit.EchoMode.Password)
@@ -131,10 +327,6 @@ class PassphraseDialog(QDialog):
     def get_passphrase(self) -> str:
         return self.pass1_edit.text()
 
-
-# ==============================================================================
-# Wayland-Compatible File Drop Zone
-# ==============================================================================
 
 class FileDropArea(QFrame):
     """A drop target that also provides a fallback button for Wayland reliability."""
@@ -177,7 +369,600 @@ class FileDropArea(QFrame):
 
 
 # ==============================================================================
-# SecretBridge Tab
+# Reusable Monospace YAML Configuration Editor
+# ==============================================================================
+
+class YamlEditorWidget(QWidget):
+    """
+    Monospace YAML file editor with validation, automatic .bak backups,
+    and default restoration.
+    """
+
+    def __init__(
+        self,
+        file_path: Path,
+        default_content: str,
+        help_text: str,
+        log_callback,
+        parent: Optional[QWidget] = None
+    ):
+        super().__init__(parent)
+        self.file_path = file_path
+        self.default_content = default_content
+        self.help_text = help_text
+        self.log_callback = log_callback
+
+        self.init_ui()
+        self.reload_from_disk()
+
+    def init_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # Header with title and one-line help text
+        header_layout = QHBoxLayout()
+        title_lbl = QLabel(f"<b>Configuration:</b> <code>{self.file_path.name}</code>", self)
+        header_layout.addWidget(title_lbl)
+
+        help_lbl = QLabel(f"<span style='color: #666;'>({self.help_text})</span>", self)
+        header_layout.addWidget(help_lbl)
+        header_layout.addStretch()
+        layout.addLayout(header_layout)
+
+        # Monospace Text Editor
+        self.editor = QTextEdit(self)
+        self.editor.setFont(QFont("Monospace", 9))
+        self.editor.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        layout.addWidget(self.editor)
+
+        # Action Buttons Bar
+        btn_layout = QHBoxLayout()
+        self.save_btn = QPushButton("Save Configuration", self)
+        self.save_btn.clicked.connect(self.save_yaml)
+        btn_layout.addWidget(self.save_btn)
+
+        self.reload_btn = QPushButton("Reload from Disk", self)
+        self.reload_btn.clicked.connect(self.reload_from_disk)
+        btn_layout.addWidget(self.reload_btn)
+
+        self.reset_btn = QPushButton("Reset to Defaults", self)
+        self.reset_btn.clicked.connect(self.reset_defaults)
+        btn_layout.addWidget(self.reset_btn)
+
+        btn_layout.addStretch()
+        self.custom_btn_layout = QHBoxLayout()
+        btn_layout.addLayout(self.custom_btn_layout)
+
+        layout.addLayout(btn_layout)
+
+    def reload_from_disk(self) -> None:
+        """Loads YAML content from disk, writing defaults if file does not exist."""
+        if not self.file_path.exists():
+            try:
+                self.file_path.parent.mkdir(parents=True, exist_ok=True)
+                self.file_path.write_text(self.default_content, encoding="utf-8")
+            except Exception as e:
+                self.log_callback(f"Error creating default {self.file_path.name}: {e}")
+
+        try:
+            content = self.file_path.read_text(encoding="utf-8")
+            self.editor.setPlainText(content)
+            self.log_callback(f"Loaded {self.file_path.name} into editor")
+        except Exception as e:
+            self.editor.setPlainText(f"# Error reading {self.file_path.name}: {e}")
+
+    def save_yaml(self) -> bool:
+        """Validates YAML syntax, creates a .bak backup, and writes to disk."""
+        content = self.editor.toPlainText()
+
+        # Validate with yaml.safe_load
+        if yaml is not None:
+            try:
+                parsed = yaml.safe_load(content)
+                if not isinstance(parsed, dict) and parsed is not None:
+                    QMessageBox.warning(self, "Invalid YAML", "Configuration must be a top-level YAML mapping/dictionary.")
+                    return False
+            except Exception as e:
+                QMessageBox.warning(self, "YAML Syntax Error", f"Failed to validate YAML:\n\n{e}")
+                return False
+
+        # Create .bak copy before writing
+        if self.file_path.exists():
+            try:
+                bak_path = self.file_path.with_name(self.file_path.name + ".bak")
+                shutil.copyfile(self.file_path, bak_path)
+            except Exception as e:
+                self.log_callback(f"Notice: Could not write backup file: {e}")
+
+        try:
+            self.file_path.write_text(content, encoding="utf-8")
+            self.log_callback(f"Saved {self.file_path.name} (backup copy at {self.file_path.name}.bak)")
+            QMessageBox.information(
+                self,
+                "Saved",
+                f"Configuration saved successfully!\n\nA backup copy was preserved at:\n{self.file_path.name}.bak"
+            )
+            return True
+        except Exception as e:
+            QMessageBox.critical(self, "Error Saving", f"Failed to write file:\n{e}")
+            return False
+
+    def reset_defaults(self) -> None:
+        """Prompts user before resetting editor and file to defaults."""
+        res = QMessageBox.question(
+            self,
+            "Reset Configuration",
+            f"Are you sure you want to reset {self.file_path.name} to default settings?\n"
+            "A .bak backup of your current file will be preserved.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if res == QMessageBox.StandardButton.Yes:
+            self.editor.setPlainText(self.default_content)
+            self.save_yaml()
+
+
+# ==============================================================================
+# Tab 1: Dashboard
+# ==============================================================================
+
+class DashboardTab(QWidget):
+    """Live system overview with focus metrics, activity bars, event counters, and audit trigger."""
+
+    def __init__(self, run_command_callback, log_callback, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.run_command_callback = run_command_callback
+        self.log_callback = log_callback
+
+        self.init_ui()
+
+        # Auto-refresh timer every 10 seconds (10,000 ms)
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self.refresh_data)
+        self.refresh_timer.start(10000)
+
+        self.refresh_data()
+
+    def init_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        # Header controls
+        header_layout = QHBoxLayout()
+        header_layout.addWidget(QLabel("<h2>Today's Activity Overview</h2>", self))
+        header_layout.addStretch()
+
+        self.timer_info = QLabel("Auto-refresh: 10s", self)
+        self.timer_info.setStyleSheet("color: #777; font-size: 11px;")
+        header_layout.addWidget(self.timer_info)
+
+        self.refresh_btn = QPushButton("Refresh Now", self)
+        self.refresh_btn.clicked.connect(self.refresh_data)
+        header_layout.addWidget(self.refresh_btn)
+
+        self.audit_btn = QPushButton("Generate Audit Report", self)
+        self.audit_btn.clicked.connect(self.generate_audit_report)
+        header_layout.addWidget(self.audit_btn)
+
+        layout.addLayout(header_layout)
+
+        # Top Section: Focus Score Progress Bar
+        score_group = QGroupBox("Focus Score (Focus / [Focus + Distraction])", self)
+        score_layout = QVBoxLayout(score_group)
+
+        self.score_bar = QProgressBar(self)
+        self.score_bar.setRange(0, 100)
+        self.score_bar.setValue(0)
+        self.score_bar.setFixedHeight(26)
+        self.score_bar.setFormat("%p% Focus Score")
+        self.score_bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        score_layout.addWidget(self.score_bar)
+
+        layout.addWidget(score_group)
+
+        # Middle Section: Time Breakdown Simple Bars
+        breakdown_group = QGroupBox("Active Time Breakdown (Minutes Today)", self)
+        grid = QGridLayout(breakdown_group)
+
+        grid.addWidget(QLabel("<b>Focus Time:</b>", self), 0, 0)
+        self.focus_bar = QProgressBar(self)
+        self.focus_bar.setTextVisible(True)
+        grid.addWidget(self.focus_bar, 0, 1)
+        self.focus_lbl = QLabel("0m", self)
+        grid.addWidget(self.focus_lbl, 0, 2)
+
+        grid.addWidget(QLabel("<b>Distraction Time:</b>", self), 1, 0)
+        self.distract_bar = QProgressBar(self)
+        self.distract_bar.setTextVisible(True)
+        grid.addWidget(self.distract_bar, 1, 1)
+        self.distract_lbl = QLabel("0m", self)
+        grid.addWidget(self.distract_lbl, 1, 2)
+
+        grid.addWidget(QLabel("<b>Neutral Time:</b>", self), 2, 0)
+        self.neutral_bar = QProgressBar(self)
+        self.neutral_bar.setTextVisible(True)
+        grid.addWidget(self.neutral_bar, 2, 1)
+        self.neutral_lbl = QLabel("0m", self)
+        grid.addWidget(self.neutral_lbl, 2, 2)
+
+        layout.addWidget(breakdown_group)
+
+        # Bottom Section: Event Counters
+        counters_group = QGroupBox("Today's Event Totals", self)
+        cnt_layout = QGridLayout(counters_group)
+
+        self.switches_val = QLabel("<b>0</b>", self)
+        cnt_layout.addWidget(QLabel("Window Switches:"), 0, 0)
+        cnt_layout.addWidget(self.switches_val, 0, 1)
+
+        self.breaks_val = QLabel("<b>0</b>", self)
+        cnt_layout.addWidget(QLabel("Breaks Prompted:"), 0, 2)
+        cnt_layout.addWidget(self.breaks_val, 0, 3)
+
+        self.rests_val = QLabel("<b>0</b>", self)
+        cnt_layout.addWidget(QLabel("Natural Rests (5m+):"), 1, 0)
+        cnt_layout.addWidget(self.rests_val, 1, 1)
+
+        self.enc_val = QLabel("<b>0</b>", self)
+        cnt_layout.addWidget(QLabel("Messages Encrypted:"), 1, 2)
+        cnt_layout.addWidget(self.enc_val, 1, 3)
+
+        self.dec_val = QLabel("<b>0</b>", self)
+        cnt_layout.addWidget(QLabel("Messages Decrypted:"), 2, 2)
+        cnt_layout.addWidget(self.dec_val, 2, 3)
+
+        layout.addWidget(counters_group)
+        layout.addStretch()
+
+    def refresh_data(self) -> None:
+        """Queries databases and refreshes all dashboard values."""
+        focus_m = get_today_focus_metrics()
+        ergo_m = get_today_ergo_metrics()
+        audit_m = get_today_audit_metrics()
+
+        # Update Score
+        score = int(round(focus_m["focus_score"]))
+        self.score_bar.setValue(score)
+
+        # Update Time Breakdown Bars (in whole minutes)
+        f_min = int(round(focus_m["focus_seconds"] / 60.0))
+        d_min = int(round(focus_m["distraction_seconds"] / 60.0))
+        n_min = int(round(focus_m["neutral_seconds"] / 60.0))
+        total_min = max(1, f_min + d_min + n_min)
+
+        self.focus_bar.setRange(0, total_min)
+        self.focus_bar.setValue(f_min)
+        self.focus_lbl.setText(f"{f_min} min")
+
+        self.distract_bar.setRange(0, total_min)
+        self.distract_bar.setValue(d_min)
+        self.distract_lbl.setText(f"{d_min} min")
+
+        self.neutral_bar.setRange(0, total_min)
+        self.neutral_bar.setValue(n_min)
+        self.neutral_lbl.setText(f"{n_min} min")
+
+        # Update Counters
+        self.switches_val.setText(f"<b>{focus_m['switch_count']}</b>")
+        self.breaks_val.setText(f"<b>{ergo_m['total_breaks']}</b>")
+        self.rests_val.setText(f"<b>{ergo_m['rest_detected']}</b>")
+        self.enc_val.setText(f"<b>{audit_m['encrypted_today']}</b>")
+        self.dec_val.setText(f"<b>{audit_m['decrypted_today']}</b>")
+
+    def generate_audit_report(self) -> None:
+        self.log_callback("Triggered 'audit' command from Dashboard")
+        self.run_command_callback(["audit"])
+
+
+# ==============================================================================
+# Tab 2: FocusPulse
+# ==============================================================================
+
+class FocusPulseTab(QWidget):
+    """FocusPulse window activity controller, live status, metrics, and YAML editor."""
+
+    def __init__(
+        self,
+        run_devpulse_proc,
+        stop_devpulse_proc,
+        run_command_callback,
+        log_callback,
+        parent: Optional[QWidget] = None
+    ):
+        super().__init__(parent)
+        self.run_devpulse_proc = run_devpulse_proc
+        self.stop_devpulse_proc = stop_devpulse_proc
+        self.run_command_callback = run_command_callback
+        self.log_callback = log_callback
+        self.is_running = False
+
+        self.init_ui()
+        self.refresh_stats()
+
+    def init_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        # Control & Status Header
+        ctrl_group = QGroupBox("FocusPulse Tracker Control", self)
+        ctrl_layout = QHBoxLayout(ctrl_group)
+
+        self.start_stop_btn = QPushButton("Start FocusPulse", self)
+        self.start_stop_btn.setFixedHeight(34)
+        self.start_stop_btn.clicked.connect(self.toggle_service)
+        ctrl_layout.addWidget(self.start_stop_btn)
+
+        self.status_lbl = QLabel("Status: <b>Stopped</b>", self)
+        ctrl_layout.addWidget(self.status_lbl)
+
+        self.selftest_btn = QPushButton("Run Selftest", self)
+        self.selftest_btn.setFixedHeight(34)
+        self.selftest_btn.clicked.connect(self.trigger_selftest)
+        ctrl_layout.addWidget(self.selftest_btn)
+
+        ctrl_layout.addStretch()
+
+        self.refresh_stats_btn = QPushButton("Refresh Stats", self)
+        self.refresh_stats_btn.clicked.connect(self.refresh_stats)
+        ctrl_layout.addWidget(self.refresh_stats_btn)
+
+        layout.addWidget(ctrl_group)
+
+        # Today's Summary Numbers
+        summary_group = QGroupBox("Today's Focus Metrics", self)
+        sum_layout = QGridLayout(summary_group)
+
+        self.f_time_lbl = QLabel("0s", self)
+        sum_layout.addWidget(QLabel("Focus Time:"), 0, 0)
+        sum_layout.addWidget(self.f_time_lbl, 0, 1)
+
+        self.d_time_lbl = QLabel("0s", self)
+        sum_layout.addWidget(QLabel("Distraction Time:"), 0, 2)
+        sum_layout.addWidget(self.d_time_lbl, 0, 3)
+
+        self.n_time_lbl = QLabel("0s", self)
+        sum_layout.addWidget(QLabel("Neutral Time:"), 0, 4)
+        sum_layout.addWidget(self.n_time_lbl, 0, 5)
+
+        self.sw_lbl = QLabel("0", self)
+        sum_layout.addWidget(QLabel("Window Switches:"), 1, 0)
+        sum_layout.addWidget(self.sw_lbl, 1, 1)
+
+        self.score_lbl = QLabel("0.0%", self)
+        sum_layout.addWidget(QLabel("Focus Score:"), 1, 2)
+        sum_layout.addWidget(self.score_lbl, 1, 3)
+
+        layout.addWidget(summary_group)
+
+        # Built-in YAML Editor for ~/.config/devpulse/focus.yaml
+        yaml_help = "Allow-list is evaluated first, then block-list. Everything else defaults to neutral."
+        self.yaml_editor = YamlEditorWidget(
+            file_path=focus.get_rules_path(),
+            default_content=focus.DEFAULT_FOCUS_YAML,
+            help_text=yaml_help,
+            log_callback=self.log_callback,
+            parent=self
+        )
+        layout.addWidget(self.yaml_editor)
+
+    def toggle_service(self) -> None:
+        if not self.is_running:
+            success = self.run_devpulse_proc("focus", ["focus", "start"], self.on_process_ended)
+            if success:
+                self.is_running = True
+                self.start_stop_btn.setText("Stop FocusPulse")
+                self.status_lbl.setText("Status: <span style='color: green;'><b>Running</b></span>")
+                self.log_callback("FocusPulse background tracker started")
+        else:
+            self.stop_devpulse_proc("focus")
+            self.is_running = False
+            self.start_stop_btn.setText("Start FocusPulse")
+            self.status_lbl.setText("Status: <b>Stopped</b>")
+            self.log_callback("FocusPulse background tracker stopped")
+            self.refresh_stats()
+
+    def on_process_ended(self) -> None:
+        self.is_running = False
+        self.start_stop_btn.setText("Start FocusPulse")
+        self.status_lbl.setText("Status: <b>Stopped</b>")
+        self.refresh_stats()
+
+    def trigger_selftest(self) -> None:
+        self.log_callback("Running 'focus selftest' through console...")
+        self.run_command_callback(["focus", "selftest"])
+
+    def refresh_stats(self) -> None:
+        m = get_today_focus_metrics()
+        self.f_time_lbl.setText(f"<b>{focus.format_duration(m['focus_seconds'])}</b>")
+        self.d_time_lbl.setText(f"<b>{focus.format_duration(m['distraction_seconds'])}</b>")
+        self.n_time_lbl.setText(f"<b>{focus.format_duration(m['neutral_seconds'])}</b>")
+        self.sw_lbl.setText(f"<b>{m['switch_count']}</b>")
+        self.score_lbl.setText(f"<b>{m['focus_score']}%</b>")
+
+
+# ==============================================================================
+# Tab 3: ErgoGuard
+# ==============================================================================
+
+class ErgoGuardTab(QWidget):
+    """ErgoGuard monitor controller, reset triggers, event counts, and ergo.yaml editor."""
+
+    def __init__(
+        self,
+        run_devpulse_proc,
+        stop_devpulse_proc,
+        run_command_callback,
+        log_callback,
+        parent: Optional[QWidget] = None
+    ):
+        super().__init__(parent)
+        self.run_devpulse_proc = run_devpulse_proc
+        self.stop_devpulse_proc = stop_devpulse_proc
+        self.run_command_callback = run_command_callback
+        self.log_callback = log_callback
+        self.is_running = False
+
+        self.init_ui()
+        self.refresh_stats()
+
+    def init_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        # Control Header
+        ctrl_group = QGroupBox("ErgoGuard Monitor Control", self)
+        ctrl_layout = QHBoxLayout(ctrl_group)
+
+        self.start_stop_btn = QPushButton("Start ErgoGuard", self)
+        self.start_stop_btn.setFixedHeight(34)
+        self.start_stop_btn.clicked.connect(self.toggle_service)
+        ctrl_layout.addWidget(self.start_stop_btn)
+
+        self.status_lbl = QLabel("Status: <b>Stopped</b>", self)
+        ctrl_layout.addWidget(self.status_lbl)
+
+        self.done_btn = QPushButton("Done (Reset Timers)", self)
+        self.done_btn.setFixedHeight(34)
+        self.done_btn.clicked.connect(self.trigger_done)
+        ctrl_layout.addWidget(self.done_btn)
+
+        self.selftest_btn = QPushButton("Run Selftest", self)
+        self.selftest_btn.setFixedHeight(34)
+        self.selftest_btn.clicked.connect(self.trigger_selftest)
+        ctrl_layout.addWidget(self.selftest_btn)
+
+        ctrl_layout.addStretch()
+
+        self.refresh_btn = QPushButton("Refresh Stats", self)
+        self.refresh_btn.clicked.connect(self.refresh_stats)
+        ctrl_layout.addWidget(self.refresh_btn)
+
+        layout.addWidget(ctrl_group)
+
+        # Today's Event Counts
+        events_group = QGroupBox("Today's Ergonomic Statistics", self)
+        ev_layout = QGridLayout(events_group)
+
+        self.active_time_lbl = QLabel("0m", self)
+        ev_layout.addWidget(QLabel("Active Work Time:"), 0, 0)
+        ev_layout.addWidget(self.active_time_lbl, 0, 1)
+
+        self.breaks_lbl = QLabel("0", self)
+        ev_layout.addWidget(QLabel("Breaks Prompted:"), 0, 2)
+        ev_layout.addWidget(self.breaks_lbl, 0, 3)
+
+        self.rests_lbl = QLabel("0", self)
+        ev_layout.addWidget(QLabel("Natural Rests (5m+):"), 1, 0)
+        ev_layout.addWidget(self.rests_lbl, 1, 1)
+
+        self.commits_lbl = QLabel("0", self)
+        ev_layout.addWidget(QLabel("Git Commits:"), 1, 2)
+        ev_layout.addWidget(self.commits_lbl, 1, 3)
+
+        self.manual_lbl = QLabel("0", self)
+        ev_layout.addWidget(QLabel("Manual Resets:"), 2, 0)
+        ev_layout.addWidget(self.manual_lbl, 2, 1)
+
+        self.last_break_lbl = QLabel("None", self)
+        ev_layout.addWidget(QLabel("Last Break Time:"), 2, 2)
+        ev_layout.addWidget(self.last_break_lbl, 2, 3)
+
+        layout.addWidget(events_group)
+
+        # Built-in YAML Editor for ~/.config/devpulse/ergo.yaml
+        yaml_help = "Break intervals in active minutes. Git watch roots scanned 1 level deep."
+        self.yaml_editor = YamlEditorWidget(
+            file_path=ergo.get_ergo_yaml_path(),
+            default_content=ergo.DEFAULT_ERGO_YAML,
+            help_text=yaml_help,
+            log_callback=self.log_callback,
+            parent=self
+        )
+
+        # Add "Test timings (1/2 min)" and "Restore 20/45/90" buttons
+        self.test_timings_btn = QPushButton("Test Timings (1/2 min)", self)
+        self.test_timings_btn.clicked.connect(self.apply_test_timings)
+        self.yaml_editor.custom_btn_layout.addWidget(self.test_timings_btn)
+
+        self.restore_timings_btn = QPushButton("Restore 20/45/90", self)
+        self.restore_timings_btn.clicked.connect(self.apply_default_timings)
+        self.yaml_editor.custom_btn_layout.addWidget(self.restore_timings_btn)
+
+        layout.addWidget(self.yaml_editor)
+
+    def toggle_service(self) -> None:
+        if not self.is_running:
+            success = self.run_devpulse_proc("ergo", ["ergo", "start"], self.on_process_ended)
+            if success:
+                self.is_running = True
+                self.start_stop_btn.setText("Stop ErgoGuard")
+                self.status_lbl.setText("Status: <span style='color: green;'><b>Running</b></span>")
+                self.log_callback("ErgoGuard background monitor started")
+        else:
+            self.stop_devpulse_proc("ergo")
+            self.is_running = False
+            self.start_stop_btn.setText("Start ErgoGuard")
+            self.status_lbl.setText("Status: <b>Stopped</b>")
+            self.log_callback("ErgoGuard background monitor stopped")
+            self.refresh_stats()
+
+    def on_process_ended(self) -> None:
+        self.is_running = False
+        self.start_stop_btn.setText("Start ErgoGuard")
+        self.status_lbl.setText("Status: <b>Stopped</b>")
+        self.refresh_stats()
+
+    def trigger_done(self) -> None:
+        self.log_callback("Running 'ergo done' through console...")
+        self.run_command_callback(["ergo", "done"])
+
+    def trigger_selftest(self) -> None:
+        self.log_callback("Running 'ergo selftest' through console...")
+        self.run_command_callback(["ergo", "selftest"])
+
+    def refresh_stats(self) -> None:
+        m = get_today_ergo_metrics()
+        self.active_time_lbl.setText(f"<b>{m['active_minutes']} min</b>")
+        self.breaks_lbl.setText(f"<b>{m['total_breaks']}</b>")
+        self.rests_lbl.setText(f"<b>{m['rest_detected']}</b>")
+        self.commits_lbl.setText(f"<b>{m['commit_detected']}</b>")
+        self.manual_lbl.setText(f"<b>{m['manual_done']}</b>")
+        self.last_break_lbl.setText(f"<b>{m['last_break_time']}</b>")
+
+    def _modify_break_intervals(self, eye_min: int, stretch_min: int, walk_min: int) -> None:
+        """Helper to modify intervals in YAML editor and disk after reading real structure."""
+        content = self.yaml_editor.editor.toPlainText()
+        data = None
+        if yaml is not None:
+            try:
+                data = yaml.safe_load(content)
+            except Exception:
+                pass
+
+        if not isinstance(data, dict) or "breaks" not in data:
+            data = ergo.load_ergo_config()
+
+        # Update values on real structure
+        data["breaks"]["eye"]["interval_minutes"] = eye_min
+        data["breaks"]["stretch"]["interval_minutes"] = stretch_min
+        data["breaks"]["walk"]["interval_minutes"] = walk_min
+
+        if yaml is not None:
+            new_yaml = yaml.dump(data, sort_keys=False, default_flow_style=False)
+        else:
+            new_yaml = ergo.DEFAULT_ERGO_YAML
+
+        self.yaml_editor.editor.setPlainText(new_yaml)
+        self.yaml_editor.save_yaml()
+
+    def apply_test_timings(self) -> None:
+        self._modify_break_intervals(eye_min=1, stretch_min=2, walk_min=3)
+        self.log_callback("Configured short test intervals: Eye=1m, Stretch=2m, Walk=3m")
+
+    def apply_default_timings(self) -> None:
+        self._modify_break_intervals(eye_min=20, stretch_min=45, walk_min=90)
+        self.log_callback("Restored default ergonomic intervals: Eye=20m, Stretch=45m, Walk=90m")
+
+
+# ==============================================================================
+# SecretBridge Tab (Preserved 100% Intact as Requested)
 # ==============================================================================
 
 class SecretBridgeTab(QWidget):
@@ -193,18 +978,15 @@ class SecretBridgeTab(QWidget):
     def init_ui(self) -> None:
         main_layout = QHBoxLayout(self)
 
-        # Main horizontal splitter: Left side (Tool), Right side (Help)
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
         main_layout.addWidget(splitter)
 
-        # ----------------------------------------------------------------------
-        # Left Side: The Cryptography Tool
-        # ----------------------------------------------------------------------
+        # Left Side
         left_widget = QWidget(self)
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(4, 4, 4, 4)
 
-        # Top Section: My Key Area
+        # My Key Area
         key_group = QGroupBox("My Identity & Public Key", self)
         key_layout = QVBoxLayout(key_group)
 
@@ -230,7 +1012,7 @@ class SecretBridgeTab(QWidget):
         key_layout.addLayout(key_btn_layout)
         left_layout.addWidget(key_group)
 
-        # Mode Selector: SEND vs OPEN
+        # Mode Selector
         mode_btn_layout = QHBoxLayout()
         mode_btn_layout.addWidget(QLabel("Action:", self))
         self.mode_send_radio = QRadioButton("SEND (Encrypt .env for Chat)", self)
@@ -247,7 +1029,7 @@ class SecretBridgeTab(QWidget):
         mode_btn_layout.addStretch()
         left_layout.addLayout(mode_btn_layout)
 
-        # Stacked / Conditional Area Container
+        # Containers
         self.send_container = QWidget(self)
         self.init_send_ui(self.send_container)
         left_layout.addWidget(self.send_container)
@@ -260,9 +1042,7 @@ class SecretBridgeTab(QWidget):
         left_layout.addStretch()
         splitter.addWidget(left_widget)
 
-        # ----------------------------------------------------------------------
-        # Right Side: Interactive Help Panel
-        # ----------------------------------------------------------------------
+        # Right Side Help
         right_widget = QWidget(self)
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(4, 4, 4, 4)
@@ -282,14 +1062,10 @@ class SecretBridgeTab(QWidget):
 
         self.update_help_text("send")
 
-    # --------------------------------------------------------------------------
-    # SEND UI Builder
-    # --------------------------------------------------------------------------
     def init_send_ui(self, container: QWidget) -> None:
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # File Selection & Sample Generator
         file_group = QGroupBox("1. Select .env File", container)
         file_layout = QVBoxLayout(file_group)
 
@@ -308,7 +1084,6 @@ class SecretBridgeTab(QWidget):
         file_actions_layout.addStretch()
         file_layout.addLayout(file_actions_layout)
 
-        # Masked Preview
         file_layout.addWidget(QLabel("Masked Preview (Variable names visible, values hidden):", self))
         self.preview_edit = QTextEdit(self)
         self.preview_edit.setReadOnly(True)
@@ -318,7 +1093,6 @@ class SecretBridgeTab(QWidget):
 
         layout.addWidget(file_group)
 
-        # Encryption Settings
         enc_group = QGroupBox("2. Encryption Options", container)
         enc_layout = QVBoxLayout(enc_group)
 
@@ -333,7 +1107,6 @@ class SecretBridgeTab(QWidget):
         type_layout.addStretch()
         enc_layout.addLayout(type_layout)
 
-        # Public key recipient field
         self.pubkey_container = QWidget(self)
         pub_layout = QVBoxLayout(self.pubkey_container)
         pub_layout.setContentsMargins(0, 0, 0, 0)
@@ -356,7 +1129,6 @@ class SecretBridgeTab(QWidget):
 
         enc_layout.addWidget(self.pubkey_container)
 
-        # Expiry options
         expiry_layout = QHBoxLayout()
         expiry_layout.addWidget(QLabel("Expires in (hours, 0 = none):", self))
         self.expiry_spin = QSpinBox(self)
@@ -368,7 +1140,6 @@ class SecretBridgeTab(QWidget):
 
         layout.addWidget(enc_group)
 
-        # Encrypt Action & Token Output
         action_layout = QHBoxLayout()
         self.encrypt_btn = QPushButton("Encrypt & Generate Token", self)
         self.encrypt_btn.setFixedHeight(34)
@@ -397,9 +1168,6 @@ class SecretBridgeTab(QWidget):
 
         layout.addWidget(result_group)
 
-    # --------------------------------------------------------------------------
-    # OPEN UI Builder
-    # --------------------------------------------------------------------------
     def init_open_ui(self, container: QWidget) -> None:
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -443,9 +1211,6 @@ class SecretBridgeTab(QWidget):
         layout.addWidget(out_group)
         self.last_decrypted_payload: Optional[dict] = None
 
-    # --------------------------------------------------------------------------
-    # Event Handlers & Core Interactions
-    # --------------------------------------------------------------------------
     def on_mode_toggled(self, button_id: int, checked: bool) -> None:
         if checked:
             if button_id == 1:
@@ -579,7 +1344,6 @@ class SecretBridgeTab(QWidget):
             )
 
             if self.type_pass_radio.isChecked():
-                # Passphrase mode
                 dlg = PassphraseDialog(self)
                 if dlg.exec() != QDialog.DialogCode.Accepted:
                     return
@@ -595,7 +1359,6 @@ class SecretBridgeTab(QWidget):
                     "(such as a voice call), never in the chat where you send the token!"
                 )
             else:
-                # Public-key mode
                 recipient_input = self.recipient_key_edit.text().strip()
                 if not recipient_input:
                     QMessageBox.warning(self, "Missing Recipient", "Please enter the recipient's public key.")
@@ -711,9 +1474,6 @@ class SecretBridgeTab(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Save Error", f"Failed to save file: {e}")
 
-    # --------------------------------------------------------------------------
-    # Right-Side Guide Text
-    # --------------------------------------------------------------------------
     def update_help_text(self, mode: str) -> None:
         if mode == "send":
             self.help_text.setHtml(
@@ -743,72 +1503,60 @@ class SecretBridgeTab(QWidget):
 
 
 # ==============================================================================
-# Placeholder Tab Builder
-# ==============================================================================
-
-def create_placeholder_tab(title: str, subtitle: str) -> QWidget:
-    """Builds a placeholder view for tabs scheduled for Round 2."""
-    widget = QWidget()
-    layout = QVBoxLayout(widget)
-    layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-    lbl_title = QLabel(title, widget)
-    lbl_title.setStyleSheet("font-size: 20px; font-weight: bold; color: #555;")
-    layout.addWidget(lbl_title)
-
-    lbl_sub = QLabel(f"Coming in Round 2\n\n{subtitle}", widget)
-    lbl_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    lbl_sub.setStyleSheet("font-size: 13px; color: #777; margin-top: 10px;")
-    layout.addWidget(lbl_sub)
-
-    return widget
-
-
-# ==============================================================================
 # Main DevPulse Application Window
 # ==============================================================================
 
 class MainWindow(QMainWindow):
-    """Main DevPulse desktop window hosting the 4 tabs and bottom console dock."""
+    """Main DevPulse desktop window hosting the 4 operational tabs and bottom console dock."""
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DevPulse")
-        self.resize(1020, 760)
+        self.resize(1080, 800)
+
+        # Background process tracking
+        self.bg_processes: Dict[str, QProcess] = {}
+        self.process_end_callbacks: Dict[str, Any] = {}
 
         # Main splitter (Top: Tabs, Bottom: Collapsible Console)
         main_splitter = QSplitter(Qt.Orientation.Vertical, self)
         self.setCentralWidget(main_splitter)
 
         # ----------------------------------------------------------------------
-        # Top Panel: 4-Tab Widget
+        # Top Panel: 4 Functional Tabs
         # ----------------------------------------------------------------------
         self.tabs = QTabWidget(self)
 
-        # Tab 1: Dashboard (Placeholder)
-        self.tabs.addTab(
-            create_placeholder_tab("Dashboard", "System health overview and daily developer productivity indicators."),
-            "Dashboard"
-        )
+        # Tab 1: Dashboard
+        self.dashboard_tab = DashboardTab(self.execute_console_command_list, self.log_console, self)
+        self.tabs.addTab(self.dashboard_tab, "Dashboard")
 
-        # Tab 2: SecretBridge (Fully Built)
+        # Tab 2: SecretBridge
         self.secretbridge_tab = SecretBridgeTab(self.log_console, self)
         self.tabs.addTab(self.secretbridge_tab, "SecretBridge")
 
-        # Tab 3: FocusPulse (Placeholder)
-        self.tabs.addTab(
-            create_placeholder_tab("FocusPulse", "Active window tracker and distraction classifier for KDE Wayland."),
-            "FocusPulse"
+        # Tab 3: FocusPulse
+        self.focuspulse_tab = FocusPulseTab(
+            self.start_managed_process,
+            self.stop_managed_process,
+            self.execute_console_command_list,
+            self.log_console,
+            self
         )
+        self.tabs.addTab(self.focuspulse_tab, "FocusPulse")
 
-        # Tab 4: ErgoGuard (Placeholder)
-        self.tabs.addTab(
-            create_placeholder_tab("ErgoGuard", "Idle detector, natural rest pauses, and Git commit break triggers."),
-            "ErgoGuard"
+        # Tab 4: ErgoGuard
+        self.ergoguard_tab = ErgoGuardTab(
+            self.start_managed_process,
+            self.stop_managed_process,
+            self.execute_console_command_list,
+            self.log_console,
+            self
         )
+        self.tabs.addTab(self.ergoguard_tab, "ErgoGuard")
 
-        # Default to SecretBridge tab
-        self.tabs.setCurrentIndex(1)
+        # Default to Dashboard tab
+        self.tabs.setCurrentIndex(0)
         main_splitter.addWidget(self.tabs)
 
         # ----------------------------------------------------------------------
@@ -851,15 +1599,72 @@ class MainWindow(QMainWindow):
         console_layout.addLayout(input_layout)
         main_splitter.addWidget(console_widget)
 
-        # Set splitter proportions (75% top tabs, 25% console)
-        main_splitter.setStretchFactor(0, 75)
-        main_splitter.setStretchFactor(1, 25)
+        # Proportions: 72% tabs, 28% console
+        main_splitter.setStretchFactor(0, 72)
+        main_splitter.setStretchFactor(1, 28)
 
-        self.active_process: Optional[QProcess] = None
-        self.log_console("DevPulse GUI ready. Using offline modules.")
+        self.console_process: Optional[QProcess] = None
+        self.log_console("DevPulse GUI ready. 100% offline.")
 
     # --------------------------------------------------------------------------
-    # Console & Process Execution Engine
+    # Managed Background Process Runner (FocusPulse & ErgoGuard)
+    # --------------------------------------------------------------------------
+    def start_managed_process(self, name: str, args: List[str], on_exit_callback=None) -> bool:
+        """Starts a named persistent service process (focus start or ergo start) and streams to console."""
+        if name in self.bg_processes and self.bg_processes[name].state() == QProcess.ProcessState.Running:
+            self.stop_managed_process(name)
+
+        devpulse_script = Path(__file__).parent / "devpulse.py"
+        if not devpulse_script.is_file():
+            self.log_console(f"Error: devpulse.py not found at {devpulse_script}")
+            return False
+
+        proc = QProcess(self)
+        proc.setProgram(sys.executable)
+        proc.setArguments([str(devpulse_script), *args])
+
+        proc.readyReadStandardOutput.connect(lambda: self._on_proc_stdout(proc))
+        proc.readyReadStandardError.connect(lambda: self._on_proc_stderr(proc))
+
+        if on_exit_callback:
+            self.process_end_callbacks[name] = on_exit_callback
+            proc.finished.connect(lambda exit_code: self._on_managed_finished(name, exit_code))
+
+        self.log_console(f"$ devpulse {' '.join(args)} (Service: {name})")
+        proc.start()
+        self.bg_processes[name] = proc
+        return True
+
+    def stop_managed_process(self, name: str) -> None:
+        """Stops a named persistent service cleanly."""
+        if name in self.bg_processes:
+            proc = self.bg_processes[name]
+            if proc.state() == QProcess.ProcessState.Running:
+                self.log_console(f"Stopping service '{name}'...")
+                proc.terminate()
+                if not proc.waitForFinished(1500):
+                    proc.kill()
+                    proc.waitForFinished(500)
+            del self.bg_processes[name]
+
+    def _on_proc_stdout(self, proc: QProcess) -> None:
+        data = proc.readAllStandardOutput().data().decode("utf-8", errors="replace")
+        self.console_output.insertPlainText(data)
+        self.console_output.ensureCursorVisible()
+
+    def _on_proc_stderr(self, proc: QProcess) -> None:
+        data = proc.readAllStandardError().data().decode("utf-8", errors="replace")
+        self.console_output.insertPlainText(data)
+        self.console_output.ensureCursorVisible()
+
+    def _on_managed_finished(self, name: str, exit_code: int) -> None:
+        self.log_console(f"Service '{name}' exited with code {exit_code}")
+        cb = self.process_end_callbacks.pop(name, None)
+        if cb:
+            cb()
+
+    # --------------------------------------------------------------------------
+    # General Console Process Runner
     # --------------------------------------------------------------------------
     def log_console(self, text: str) -> None:
         """Appends a timestamped log line to the console panel."""
@@ -887,7 +1692,7 @@ class MainWindow(QMainWindow):
         if not tokens:
             return
 
-        # Strip redundant command prefixes if user typed them
+        # Strip redundant prefixes
         if tokens[0] in ("python", "python3", "devpulse", "devpulse.py", "./devpulse.py"):
             tokens = tokens[1:]
             if tokens and tokens[0].endswith(".py"):
@@ -908,48 +1713,79 @@ class MainWindow(QMainWindow):
 
         self.run_devpulse(tokens)
 
+    def execute_console_command_list(self, args: List[str]) -> None:
+        self.run_devpulse(args)
+
     def run_devpulse(self, args: List[str]) -> bool:
         """
         Reusable function to execute devpulse.py with arguments and stream output live.
-        Other tabs can call this later to run background trackers or status commands.
+        Can be used by other tabs or console inputs to run one-off tasks.
         """
-        if self.active_process and self.active_process.state() == QProcess.ProcessState.Running:
-            self.log_console("Terminating previous process...")
-            self.active_process.terminate()
-            self.active_process.waitForFinished(1000)
+        if self.console_process and self.console_process.state() == QProcess.ProcessState.Running:
+            self.log_console("Terminating previous console command...")
+            self.console_process.terminate()
+            self.console_process.waitForFinished(1000)
 
         devpulse_script = Path(__file__).parent / "devpulse.py"
         if not devpulse_script.is_file():
-            self.log_console(f"Error: Could not locate devpulse.py at {devpulse_script}")
+            self.log_console(f"Error: devpulse.py not found at {devpulse_script}")
             return False
 
         self.log_console(f"$ devpulse {' '.join(args)}")
 
-        self.active_process = QProcess(self)
-        self.active_process.setProgram(sys.executable)
-        self.active_process.setArguments([str(devpulse_script), *args])
+        self.console_process = QProcess(self)
+        self.console_process.setProgram(sys.executable)
+        self.console_process.setArguments([str(devpulse_script), *args])
 
-        self.active_process.readyReadStandardOutput.connect(self._on_stdout_ready)
-        self.active_process.readyReadStandardError.connect(self._on_stderr_ready)
-        self.active_process.finished.connect(self._on_process_finished)
+        self.console_process.readyReadStandardOutput.connect(self._on_console_stdout)
+        self.console_process.readyReadStandardError.connect(self._on_console_stderr)
+        self.console_process.finished.connect(self._on_console_finished)
 
-        self.active_process.start()
+        self.console_process.start()
         return True
 
-    def _on_stdout_ready(self) -> None:
-        if self.active_process:
-            data = self.active_process.readAllStandardOutput().data().decode("utf-8", errors="replace")
+    def _on_console_stdout(self) -> None:
+        if self.console_process:
+            data = self.console_process.readAllStandardOutput().data().decode("utf-8", errors="replace")
             self.console_output.insertPlainText(data)
             self.console_output.ensureCursorVisible()
 
-    def _on_stderr_ready(self) -> None:
-        if self.active_process:
-            data = self.active_process.readAllStandardError().data().decode("utf-8", errors="replace")
+    def _on_console_stderr(self) -> None:
+        if self.console_process:
+            data = self.console_process.readAllStandardError().data().decode("utf-8", errors="replace")
             self.console_output.insertPlainText(data)
             self.console_output.ensureCursorVisible()
 
-    def _on_process_finished(self, exit_code: int) -> None:
-        self.log_console(f"Process finished with exit code {exit_code}\n")
+    def _on_console_finished(self, exit_code: int) -> None:
+        self.log_console(f"Command finished with exit code {exit_code}\n")
+        # Trigger dashboard refresh on command finish
+        self.dashboard_tab.refresh_data()
+        self.focuspulse_tab.refresh_stats()
+        self.ergoguard_tab.refresh_stats()
+
+    # --------------------------------------------------------------------------
+    # Window Close Event: Clean Shutdown
+    # --------------------------------------------------------------------------
+    def closeEvent(self, event) -> None:
+        """Stops any running FocusPulse or ErgoGuard background processes on exit."""
+        # 1. Stop managed QProcesses
+        for name in list(self.bg_processes.keys()):
+            self.stop_managed_process(name)
+
+        if self.console_process and self.console_process.state() == QProcess.ProcessState.Running:
+            self.console_process.terminate()
+            self.console_process.waitForFinished(1000)
+
+        # 2. Terminate any orphan swayidle processes that might have been spawned by ergo
+        swayidle_bin = shutil.which("swayidle")
+        if swayidle_bin:
+            try:
+                import subprocess
+                subprocess.run(["pkill", "-f", "swayidle.*DevPulse"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+
+        event.accept()
 
 
 # ==============================================================================
