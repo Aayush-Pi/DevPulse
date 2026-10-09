@@ -76,7 +76,6 @@ block:
     - Netflix
     - Instagram
     - Twitch
-    - X
     - Twitter
     - Facebook
     - TikTok
