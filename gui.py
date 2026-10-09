@@ -37,10 +37,14 @@ try:
         QHBoxLayout, QSplitter, QTextEdit, QLineEdit, QPushButton,
         QLabel, QGroupBox, QFileDialog, QMessageBox, QDialog,
         QDialogButtonBox, QSpinBox, QRadioButton, QButtonGroup,
-        QScrollArea, QFrame, QProgressBar, QGridLayout
+        QScrollArea, QFrame, QProgressBar, QGridLayout,
+        QSystemTrayIcon, QMenu, QStatusBar
     )
     from PyQt6.QtCore import Qt, QProcess, pyqtSignal, QTimer
-    from PyQt6.QtGui import QFont, QDragEnterEvent, QDropEvent
+    from PyQt6.QtGui import (
+        QFont, QDragEnterEvent, QDropEvent, QIcon, QPixmap, QPainter,
+        QColor, QAction
+    )
 except ImportError:
     print(
         "\n[DevPulse Error] PyQt6 is not installed.\n"
@@ -67,6 +71,47 @@ import audit
 ALLOWED_SUBCOMMANDS = {
     "keygen", "fingerprint", "send", "open", "selftest", "focus", "ergo", "audit", "gui"
 }
+
+
+# ==============================================================================
+# Tray Icon & Graphical Helper Functions
+# ==============================================================================
+
+def create_circle_icon(color_hex: str, size: int = 22) -> QIcon:
+    """Renders a simple filled anti-aliased circle icon with QPainter without image files."""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setBrush(QColor(color_hex))
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.drawEllipse(1, 1, size - 2, size - 2)
+    painter.end()
+    return QIcon(pixmap)
+
+
+def get_latest_focus_category() -> Optional[str]:
+    """
+    Reads the most recent row in focus_events from focus.db in read-only mode.
+    Returns category ('focus', 'distraction', 'neutral') or None if unavailable.
+    Never crashes.
+    """
+    db_path = focus.get_db_path()
+    if not db_path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='focus_events';")
+        if not cur.fetchone():
+            conn.close()
+            return None
+        cur.execute("SELECT category FROM focus_events ORDER BY id DESC LIMIT 1;")
+        row = cur.fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception:
+        return None
 
 
 # ==============================================================================
@@ -666,6 +711,7 @@ class FocusPulseTab(QWidget):
         stop_devpulse_proc,
         run_command_callback,
         log_callback,
+        state_changed_callback=None,
         parent: Optional[QWidget] = None
     ):
         super().__init__(parent)
@@ -673,6 +719,7 @@ class FocusPulseTab(QWidget):
         self.stop_devpulse_proc = stop_devpulse_proc
         self.run_command_callback = run_command_callback
         self.log_callback = log_callback
+        self.state_changed_callback = state_changed_callback
         self.is_running = False
 
         self.init_ui()
@@ -751,6 +798,8 @@ class FocusPulseTab(QWidget):
                 self.start_stop_btn.setText("Stop FocusPulse")
                 self.status_lbl.setText("Status: <span style='color: green;'><b>Running</b></span>")
                 self.log_callback("FocusPulse background tracker started")
+                if self.state_changed_callback:
+                    self.state_changed_callback()
         else:
             self.stop_devpulse_proc("focus")
             self.is_running = False
@@ -758,12 +807,16 @@ class FocusPulseTab(QWidget):
             self.status_lbl.setText("Status: <b>Stopped</b>")
             self.log_callback("FocusPulse background tracker stopped")
             self.refresh_stats()
+            if self.state_changed_callback:
+                self.state_changed_callback()
 
     def on_process_ended(self) -> None:
         self.is_running = False
         self.start_stop_btn.setText("Start FocusPulse")
         self.status_lbl.setText("Status: <b>Stopped</b>")
         self.refresh_stats()
+        if self.state_changed_callback:
+            self.state_changed_callback()
 
     def trigger_selftest(self) -> None:
         self.log_callback("Running 'focus selftest' through console...")
@@ -791,6 +844,7 @@ class ErgoGuardTab(QWidget):
         stop_devpulse_proc,
         run_command_callback,
         log_callback,
+        state_changed_callback=None,
         parent: Optional[QWidget] = None
     ):
         super().__init__(parent)
@@ -798,6 +852,7 @@ class ErgoGuardTab(QWidget):
         self.stop_devpulse_proc = stop_devpulse_proc
         self.run_command_callback = run_command_callback
         self.log_callback = log_callback
+        self.state_changed_callback = state_changed_callback
         self.is_running = False
 
         self.init_ui()
@@ -895,6 +950,8 @@ class ErgoGuardTab(QWidget):
                 self.start_stop_btn.setText("Stop ErgoGuard")
                 self.status_lbl.setText("Status: <span style='color: green;'><b>Running</b></span>")
                 self.log_callback("ErgoGuard background monitor started")
+                if self.state_changed_callback:
+                    self.state_changed_callback()
         else:
             self.stop_devpulse_proc("ergo")
             self.is_running = False
@@ -902,12 +959,16 @@ class ErgoGuardTab(QWidget):
             self.status_lbl.setText("Status: <b>Stopped</b>")
             self.log_callback("ErgoGuard background monitor stopped")
             self.refresh_stats()
+            if self.state_changed_callback:
+                self.state_changed_callback()
 
     def on_process_ended(self) -> None:
         self.is_running = False
         self.start_stop_btn.setText("Start ErgoGuard")
         self.status_lbl.setText("Status: <b>Stopped</b>")
         self.refresh_stats()
+        if self.state_changed_callback:
+            self.state_changed_callback()
 
     def trigger_done(self) -> None:
         self.log_callback("Running 'ergo done' through console...")
@@ -1507,16 +1568,26 @@ class SecretBridgeTab(QWidget):
 # ==============================================================================
 
 class MainWindow(QMainWindow):
-    """Main DevPulse desktop window hosting the 4 operational tabs and bottom console dock."""
+    """Main DevPulse desktop window hosting 4 operational tabs, console dock, and system tray."""
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DevPulse")
         self.resize(1080, 800)
 
+        self.force_quit = False
+        self.has_shown_tray_message = False
+        self.paused_services: Optional[Tuple[bool, bool]] = None
+
         # Background process tracking
         self.bg_processes: Dict[str, QProcess] = {}
         self.process_end_callbacks: Dict[str, Any] = {}
+
+        # Menu Bar (File -> Quit)
+        self.init_menu_bar()
+
+        # Status Bar ("FocusPulse: running | ErgoGuard: stopped")
+        self.statusBar().showMessage("FocusPulse: stopped | ErgoGuard: stopped")
 
         # Main splitter (Top: Tabs, Bottom: Collapsible Console)
         main_splitter = QSplitter(Qt.Orientation.Vertical, self)
@@ -1541,6 +1612,7 @@ class MainWindow(QMainWindow):
             self.stop_managed_process,
             self.execute_console_command_list,
             self.log_console,
+            self.update_services_state,
             self
         )
         self.tabs.addTab(self.focuspulse_tab, "FocusPulse")
@@ -1551,6 +1623,7 @@ class MainWindow(QMainWindow):
             self.stop_managed_process,
             self.execute_console_command_list,
             self.log_console,
+            self.update_services_state,
             self
         )
         self.tabs.addTab(self.ergoguard_tab, "ErgoGuard")
@@ -1604,7 +1677,190 @@ class MainWindow(QMainWindow):
         main_splitter.setStretchFactor(1, 28)
 
         self.console_process: Optional[QProcess] = None
+
+        # ----------------------------------------------------------------------
+        # System Tray Setup & 5-Second Polling Timer
+        # ----------------------------------------------------------------------
+        self.init_system_tray()
+
+        self.tray_timer = QTimer(self)
+        self.tray_timer.timeout.connect(self.update_tray_state)
+        self.tray_timer.start(5000)
+
+        self.update_services_state()
         self.log_console("DevPulse GUI ready. 100% offline.")
+
+    def init_menu_bar(self) -> None:
+        """Configures the desktop menu bar."""
+        menu_bar = self.menuBar()
+        file_menu = menu_bar.addMenu("&File")
+
+        quit_action = QAction("&Quit", self)
+        quit_action.setShortcut("Ctrl+Q")
+        quit_action.setStatusTip("Exit DevPulse and stop all monitoring services")
+        quit_action.triggered.connect(self.quit_application)
+        file_menu.addAction(quit_action)
+
+    def init_system_tray(self) -> None:
+        """Initializes the QSystemTrayIcon with painted circle icons and right-click menu."""
+        self.icon_green = create_circle_icon("#2ecc71")
+        self.icon_amber = create_circle_icon("#f39c12")
+        self.icon_red = create_circle_icon("#e74c3c")
+        self.icon_gray = create_circle_icon("#95a5a6")
+
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(self.icon_gray)
+
+        # Tray right-click context menu
+        self.tray_menu = QMenu(self)
+
+        self.action_toggle_window = QAction("Hide Window", self)
+        self.action_toggle_window.triggered.connect(self.toggle_window_visibility)
+        self.tray_menu.addAction(self.action_toggle_window)
+
+        self.tray_menu.addSeparator()
+
+        self.action_toggle_focus = QAction("Start FocusPulse", self)
+        self.action_toggle_focus.triggered.connect(self.focuspulse_tab.toggle_service)
+        self.tray_menu.addAction(self.action_toggle_focus)
+
+        self.action_toggle_ergo = QAction("Start ErgoGuard", self)
+        self.action_toggle_ergo.triggered.connect(self.ergoguard_tab.toggle_service)
+        self.tray_menu.addAction(self.action_toggle_ergo)
+
+        self.action_break_done = QAction("Break done (reset timers)", self)
+        self.action_break_done.triggered.connect(self.ergoguard_tab.trigger_done)
+        self.tray_menu.addAction(self.action_break_done)
+
+        self.action_pause_all = QAction("Pause all", self)
+        self.action_pause_all.triggered.connect(self.toggle_pause_all)
+        self.tray_menu.addAction(self.action_pause_all)
+
+        self.tray_menu.addSeparator()
+
+        self.action_tray_quit = QAction("Quit", self)
+        self.action_tray_quit.triggered.connect(self.quit_application)
+        self.tray_menu.addAction(self.action_tray_quit)
+
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.activated.connect(self.on_tray_activated)
+
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray_icon.show()
+
+    def update_services_state(self) -> None:
+        """Synchronizes status bar and tray menu actions whenever services start/stop."""
+        focus_running = self.focuspulse_tab.is_running
+        ergo_running = self.ergoguard_tab.is_running
+
+        # Update Status Bar
+        f_str = "running" if focus_running else "stopped"
+        e_str = "running" if ergo_running else "stopped"
+        self.statusBar().showMessage(f"FocusPulse: {f_str} | ErgoGuard: {e_str}")
+
+        # Update Tray Menu Action Labels
+        self.action_toggle_focus.setText("Stop FocusPulse" if focus_running else "Start FocusPulse")
+        self.action_toggle_ergo.setText("Stop ErgoGuard" if ergo_running else "Start ErgoGuard")
+
+        if self.paused_services is None:
+            self.action_pause_all.setText("Pause all")
+        else:
+            self.action_pause_all.setText("Resume all")
+
+        self.update_tray_state()
+
+    def update_tray_state(self) -> None:
+        """
+        Polls focus.db (read-only) every 5 seconds or on transition:
+        - Gray if FocusPulse not running; green=focus, red=distraction, amber=neutral.
+        - Tooltip displays today's focus score and minutes until next break.
+        """
+        focus_running = self.focuspulse_tab.is_running
+        ergo_running = self.ergoguard_tab.is_running
+
+        # 1. Update Tray Icon Color
+        if not focus_running:
+            self.tray_icon.setIcon(self.icon_gray)
+        else:
+            category = get_latest_focus_category()
+            if category == "focus":
+                self.tray_icon.setIcon(self.icon_green)
+            elif category == "distraction":
+                self.tray_icon.setIcon(self.icon_red)
+            elif category == "neutral":
+                self.tray_icon.setIcon(self.icon_amber)
+            else:
+                self.tray_icon.setIcon(self.icon_amber)
+
+        # 2. Update Tooltip
+        focus_m = get_today_focus_metrics()
+        score = focus_m["focus_score"]
+
+        if ergo_running:
+            try:
+                ergo_cfg = ergo.load_ergo_config()
+                interval_min = ergo_cfg.get("breaks", {}).get("eye", {}).get("interval_minutes", 20)
+                ergo_m = get_today_ergo_metrics()
+                active_min = ergo_m["active_minutes"]
+                mins_left = max(1, interval_min - (active_min % interval_min))
+                tooltip = f"DevPulse\nFocus Score: {score}%\nNext break in: ~{mins_left}m"
+            except Exception:
+                tooltip = f"DevPulse\nFocus Score: {score}%"
+        else:
+            tooltip = f"DevPulse\nFocus Score: {score}%"
+
+        self.tray_icon.setToolTip(tooltip)
+
+        # 3. Update Toggle Window Text
+        if self.isVisible() and not self.isMinimized():
+            self.action_toggle_window.setText("Hide Window")
+        else:
+            self.action_toggle_window.setText("Show Window")
+
+    def toggle_pause_all(self) -> None:
+        """Stops both background services when pausing, and restarts them on resume."""
+        if self.paused_services is None:
+            was_focus = self.focuspulse_tab.is_running
+            was_ergo = self.ergoguard_tab.is_running
+
+            if was_focus:
+                self.focuspulse_tab.toggle_service()
+            if was_ergo:
+                self.ergoguard_tab.toggle_service()
+
+            self.paused_services = (was_focus, was_ergo)
+            self.log_console("Paused all background services")
+        else:
+            resume_focus, resume_ergo = self.paused_services
+            if not resume_focus and not resume_ergo:
+                resume_focus, resume_ergo = True, True
+
+            if resume_focus and not self.focuspulse_tab.is_running:
+                self.focuspulse_tab.toggle_service()
+            if resume_ergo and not self.ergoguard_tab.is_running:
+                self.ergoguard_tab.toggle_service()
+
+            self.paused_services = None
+            self.log_console("Resumed background services")
+
+        self.update_services_state()
+
+    def toggle_window_visibility(self) -> None:
+        """Toggles main window between shown and hidden."""
+        if self.isVisible() and not self.isMinimized():
+            self.hide()
+            self.action_toggle_window.setText("Show Window")
+        else:
+            self.showNormal()
+            self.activateWindow()
+            self.raise_()
+            self.action_toggle_window.setText("Hide Window")
+        self.update_tray_state()
+
+    def on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        """Handles left-click or double-click on the system tray icon."""
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+            self.toggle_window_visibility()
 
     # --------------------------------------------------------------------------
     # Managed Background Process Runner (FocusPulse & ErgoGuard)
@@ -1636,13 +1892,13 @@ class MainWindow(QMainWindow):
         return True
 
     def stop_managed_process(self, name: str) -> None:
-        """Stops a named persistent service cleanly."""
+        """Stops a named persistent service cleanly with up to 3 seconds wait."""
         if name in self.bg_processes:
             proc = self.bg_processes[name]
             if proc.state() == QProcess.ProcessState.Running:
                 self.log_console(f"Stopping service '{name}'...")
                 proc.terminate()
-                if not proc.waitForFinished(1500):
+                if not proc.waitForFinished(3000):
                     proc.kill()
                     proc.waitForFinished(500)
             del self.bg_processes[name]
@@ -1662,6 +1918,7 @@ class MainWindow(QMainWindow):
         cb = self.process_end_callbacks.pop(name, None)
         if cb:
             cb()
+        self.update_services_state()
 
     # --------------------------------------------------------------------------
     # General Console Process Runner
@@ -1762,21 +2019,35 @@ class MainWindow(QMainWindow):
         self.dashboard_tab.refresh_data()
         self.focuspulse_tab.refresh_stats()
         self.ergoguard_tab.refresh_stats()
+        self.update_services_state()
 
     # --------------------------------------------------------------------------
-    # Window Close Event: Clean Shutdown
+    # Window Close & Shutdown Management
     # --------------------------------------------------------------------------
-    def closeEvent(self, event) -> None:
-        """Stops any running FocusPulse or ErgoGuard background processes on exit."""
-        # 1. Stop managed QProcesses
+    def cleanup_processes(self) -> None:
+        """
+        Stops focus and ergo processes started by the GUI by sending a graceful terminate first
+        and waiting up to 3 seconds, then killing only if needed, so ergo can stop its own swayidle child.
+        Ensures no QProcess is destroyed while running.
+        """
         for name in list(self.bg_processes.keys()):
-            self.stop_managed_process(name)
+            proc = self.bg_processes.get(name)
+            if proc and proc.state() == QProcess.ProcessState.Running:
+                self.log_console(f"Terminating service '{name}'...")
+                proc.terminate()
+                if not proc.waitForFinished(3000):
+                    proc.kill()
+                    proc.waitForFinished(500)
+        self.bg_processes.clear()
 
         if self.console_process and self.console_process.state() == QProcess.ProcessState.Running:
             self.console_process.terminate()
-            self.console_process.waitForFinished(1000)
+            if not self.console_process.waitForFinished(3000):
+                self.console_process.kill()
+                self.console_process.waitForFinished(500)
+            self.console_process = None
 
-        # 2. Terminate any orphan swayidle processes that might have been spawned by ergo
+        # Terminate any orphan swayidle processes if spawned by ergo
         swayidle_bin = shutil.which("swayidle")
         if swayidle_bin:
             try:
@@ -1785,7 +2056,32 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        event.accept()
+    def closeEvent(self, event) -> None:
+        """Closing window with X button hides to tray instead of quitting if tray is available."""
+        if not self.force_quit and QSystemTrayIcon.isSystemTrayAvailable() and self.tray_icon.isVisible():
+            self.hide()
+            if not self.has_shown_tray_message:
+                self.tray_icon.showMessage(
+                    "DevPulse",
+                    "DevPulse is still running in the system tray.",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    3000
+                )
+                self.has_shown_tray_message = True
+            self.update_tray_state()
+            event.ignore()
+        else:
+            self.cleanup_processes()
+            self.tray_icon.hide()
+            event.accept()
+
+    def quit_application(self) -> None:
+        """Quits DevPulse after cleanly terminating all child processes."""
+        self.force_quit = True
+        self.log_console("Shutting down DevPulse and child processes...")
+        self.cleanup_processes()
+        self.tray_icon.hide()
+        QApplication.instance().quit()
 
 
 # ==============================================================================
