@@ -1,0 +1,61 @@
+{
+  "report_generated_at": "2026-10-09T20:36:57.854347+00:00",
+  "device_hostname": "perma",
+  "devpulse_version": "0.1",
+  "period": {
+    "since_days": 7,
+    "start_timestamp": "2026-10-02T20:36:57.854347+00:00",
+    "end_timestamp": "2026-10-09T20:36:57.854347+00:00"
+  },
+  "secretbridge": {
+    "by_event_type": {
+      "key_generated": 1,
+      "message_decrypted": 1,
+      "message_encrypted": 1
+    },
+    "by_mode": {
+      "none": 1,
+      "public_key": 5
+    },
+    "total_events": 3
+  },
+  "focuspulse": {
+    "focus_seconds": 42.8,
+    "distraction_seconds": 40.7,
+    "neutral_seconds": 26.5,
+    "total_seconds": 109.9,
+    "focus_score_percent": 51.2,
+    "window_switch_count": 8,
+    "top_app_classes": [
+      {
+        "class": "brave-origin",
+        "seconds": 46.8
+      },
+      {
+        "class": "org.kde.konsole",
+        "seconds": 30.5
+      },
+      {
+        "class": "org.kde.dolphin",
+        "seconds": 20.4
+      },
+      {
+        "class": "com.microsoft.VSCode",
+        "seconds": 12.2
+      }
+    ]
+  },
+  "ergoguard": {
+    "by_event_type": {
+      "break_shown": 2,
+      "rest_detected": 0,
+      "commit_detected": 0,
+      "manual_done": 1
+    },
+    "total_breaks": 2
+  },
+  "privacy": {
+    "statement": "No window titles, no keystrokes, no file contents, no cryptographic keys, and no personal data leave this computer. All metrics are computed locally from privacy-preserving event logs."
+  },
+  "integrity": "1f3362b5e5755136b6fb3e2b2b4ebf831a316334e25d990f5b6db973d5a0909a"
+}

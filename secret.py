@@ -23,6 +23,8 @@ IMPORTANT ARCHITECTURAL & SECURITY LIMITATIONS:
 ================================================================================
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import json
@@ -41,14 +43,23 @@ try:
     import nacl.utils
     import nacl.exceptions
 except ImportError:
+    # Friendly notice if PyNaCl is not yet installed
     nacl = None
     nacl_scrypt = None
 
+
+# Maximum supported file size is 64 KB (65,536 bytes)
 MAX_FILE_SIZE_BYTES = 64 * 1024
+
+# Message format prefixes
 PUBKEY_PREFIX = "DEVPULSE-PUB-v1:"
 CIPHERTEXT_PUBLIC_PREFIX = "DEVPULSE-v1:"
 CIPHERTEXT_PASSPHRASE_PREFIX = "DEVPULSE-v1P:"
 
+
+# ==============================================================================
+# Custom Exceptions (Enables friendly, traceback-free error handling in CLI)
+# ==============================================================================
 
 class SecretBridgeError(Exception):
     """Base exception for all SecretBridge domain errors."""
@@ -90,7 +101,12 @@ class InvalidMessageFormatError(SecretBridgeError):
     pass
 
 
+# ==============================================================================
+# Internal Helper Functions
+# ==============================================================================
+
 def _ensure_pynacl_available() -> None:
+    """Verifies that PyNaCl is installed before running cryptographic routines."""
     if nacl is None or nacl_scrypt is None:
         raise DependencyMissingError(
             "PyNaCl library is missing.\n"
@@ -100,6 +116,11 @@ def _ensure_pynacl_available() -> None:
 
 
 def get_config_dir() -> Path:
+    """
+    Returns the path to the DevPulse configuration directory.
+    Uses DEVPULSE_HOME environment variable if set, otherwise ~/.config/devpulse.
+    This allows simulating multiple users (e.g. Alice and Bob) on one system.
+    """
     env_override = os.environ.get("DEVPULSE_HOME")
     if env_override:
         return Path(env_override).expanduser().resolve()
@@ -107,28 +128,48 @@ def get_config_dir() -> Path:
 
 
 def compute_fingerprint(public_key_bytes: bytes) -> str:
+    """
+    Computes a human-readable 8-character fingerprint for a public key.
+    Uses the first 8 hex characters of the SHA-256 hash of the public key bytes,
+    formatted as XXXX-XXXX in uppercase (e.g., 'A1B2-C3D4').
+    """
     full_hash = hashlib.sha256(public_key_bytes).hexdigest().upper()
     first_eight = full_hash[:8]
     return f"{first_eight[:4]}-{first_eight[4:8]}"
 
+
+# ==============================================================================
+# Key Management Functions
+# ==============================================================================
 
 def generate_keypair(
     name: str,
     force: bool = False,
     config_dir: Optional[Path] = None
 ) -> Tuple[str, str, Path, Path]:
+    """
+    Generates a new Curve25519 keypair for the user.
+    - Creates the config folder with 700 permissions (user rwx only).
+    - Saves the private key to private.key with 600 permissions (user rw only).
+    - Saves the public key to public.key and sender info to config.json.
+    - Refuses to overwrite existing keys unless force=True.
+    Returns: (public_key_string, fingerprint, priv_path, pub_path).
+    """
     _ensure_pynacl_available()
+
     target_dir = config_dir or get_config_dir()
     priv_path = target_dir / "private.key"
     pub_path = target_dir / "public.key"
     conf_path = target_dir / "config.json"
 
+    # Enforce directory security
     target_dir.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(target_dir, 0o700)
     except OSError:
         pass
 
+    # Safety check against accidental key overwrites
     if priv_path.exists() and not force:
         raise KeyExistsError(
             f"Keys already exist in {target_dir}.\n"
@@ -137,16 +178,20 @@ def generate_keypair(
             "To overwrite anyway, re-run with --force."
         )
 
+    # Generate new Curve25519 private key
     private_key = nacl.public.PrivateKey.generate()
     public_key = private_key.public_key
 
+    # Save private key with strict 600 permissions
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     with open(os.open(priv_path, flags, 0o600), "wb") as f:
         f.write(bytes(private_key))
 
+    # Save public key
     with open(os.open(pub_path, flags, 0o644), "wb") as f:
         f.write(bytes(public_key))
 
+    # Save configuration profile
     with open(os.open(conf_path, flags, 0o600), "w", encoding="utf-8") as f:
         json.dump({"name": name.strip() or "Anonymous"}, f, indent=2)
 
@@ -158,6 +203,10 @@ def generate_keypair(
 
 
 def load_own_private_key(config_dir: Optional[Path] = None) -> nacl.public.PrivateKey:
+    """
+    Loads the user's private key from their configuration directory.
+    Raises KeyNotFoundError if private.key is not found.
+    """
     _ensure_pynacl_available()
     target_dir = config_dir or get_config_dir()
     priv_path = target_dir / "private.key"
@@ -172,6 +221,7 @@ def load_own_private_key(config_dir: Optional[Path] = None) -> nacl.public.Priva
     with open(priv_path, "rb") as f:
         raw = f.read()
 
+    # Support raw 32 bytes or base64 encoded
     if len(raw) == 32:
         return nacl.public.PrivateKey(raw)
     else:
@@ -183,6 +233,10 @@ def load_own_private_key(config_dir: Optional[Path] = None) -> nacl.public.Priva
 
 
 def load_own_public_key(config_dir: Optional[Path] = None) -> Tuple[nacl.public.PublicKey, str]:
+    """
+    Loads the user's public key from their configuration directory.
+    Returns: (PublicKey object, fingerprint string).
+    """
     _ensure_pynacl_available()
     target_dir = config_dir or get_config_dir()
     pub_path = target_dir / "public.key"
@@ -200,6 +254,7 @@ def load_own_public_key(config_dir: Optional[Path] = None) -> Tuple[nacl.public.
     if len(raw) == 32:
         pub_bytes = raw
     else:
+        # Check if formatted string or base64
         text = raw.decode("utf-8", errors="ignore").strip()
         if text.startswith(PUBKEY_PREFIX):
             text = text[len(PUBKEY_PREFIX):]
@@ -213,6 +268,7 @@ def load_own_public_key(config_dir: Optional[Path] = None) -> Tuple[nacl.public.
 
 
 def load_sender_name(config_dir: Optional[Path] = None) -> str:
+    """Reads sender name from config.json, defaulting to 'Anonymous' if missing."""
     target_dir = config_dir or get_config_dir()
     conf_path = target_dir / "config.json"
     if conf_path.exists():
@@ -226,9 +282,16 @@ def load_sender_name(config_dir: Optional[Path] = None) -> str:
 
 
 def parse_public_key_input(key_input: str) -> Tuple[nacl.public.PublicKey, str]:
+    """
+    Parses a public key from either:
+    1. A file path pointing to a public key file, or
+    2. A public key string starting with DEVPULSE-PUB-v1: or raw base64.
+    Returns: (PublicKey object, fingerprint string).
+    """
     _ensure_pynacl_available()
     cleaned = key_input.strip()
 
+    # Check if key_input is a path to an existing file
     potential_file = Path(cleaned)
     if potential_file.is_file():
         try:
@@ -244,6 +307,7 @@ def parse_public_key_input(key_input: str) -> Tuple[nacl.public.PublicKey, str]:
         except Exception as e:
             raise InvalidMessageFormatError(f"Could not read public key file '{cleaned}': {e}")
     else:
+        # Parse direct string input
         if cleaned.startswith(PUBKEY_PREFIX):
             cleaned = cleaned[len(PUBKEY_PREFIX):]
         try:
@@ -265,11 +329,22 @@ def parse_public_key_input(key_input: str) -> Tuple[nacl.public.PublicKey, str]:
         raise InvalidMessageFormatError(f"Failed to load public key: {e}")
 
 
+# ==============================================================================
+# Payload Construction
+# ==============================================================================
+
 def build_payload(
     file_path: Path,
     sender_name: str,
     expires_hours: Optional[float] = None
 ) -> bytes:
+    """
+    Reads the target file and packages it into a structured JSON payload.
+    - Rejects files larger than 64 KB.
+    - Encodes file content in base64 to preserve exact binary/text bytes.
+    - Records UTC created_at time and optional expires_at time.
+    Returns: utf-8 encoded JSON bytes.
+    """
     if not file_path.exists():
         raise SecretBridgeError(f"File not found: '{file_path}'")
     if not file_path.is_file():
@@ -288,7 +363,7 @@ def build_payload(
 
     now_utc = datetime.now(timezone.utc)
     expires_utc_str = None
-    if expires_hours is not None:
+    if expires_hours is not None and expires_hours > 0:
         expires_dt = now_utc + timedelta(hours=expires_hours)
         expires_utc_str = expires_dt.isoformat()
 
@@ -304,10 +379,20 @@ def build_payload(
     return json.dumps(payload_data, separators=(",", ":")).encode("utf-8")
 
 
+# ==============================================================================
+# Encryption Functions
+# ==============================================================================
+
 def encrypt_for_public_key(
     payload_bytes: bytes,
     recipient_pubkey: nacl.public.PublicKey
 ) -> str:
+    """
+    Encrypts a payload for a recipient using nacl.public.SealedBox (Curve25519).
+    SealedBox generates an ephemeral keypair under the hood, meaning only the
+    recipient's private key can decrypt it, and no one else can read it.
+    Returns: Single line 'DEVPULSE-v1:<urlsafe_base64>'.
+    """
     _ensure_pynacl_available()
     sealed_box = nacl.public.SealedBox(recipient_pubkey)
     ciphertext = sealed_box.encrypt(payload_bytes)
@@ -319,12 +404,22 @@ def encrypt_with_passphrase(
     payload_bytes: bytes,
     passphrase: str
 ) -> str:
+    """
+    Encrypts a payload using symmetric cryptography (Passphrase mode):
+    1. Generates a cryptographically secure random salt using nacl.utils.random.
+    2. Derives a 256-bit key from the passphrase using nacl.pwhash.scrypt.
+    3. Encrypts the payload with nacl.secret.SecretBox (XSalsa20-Poly1305).
+    4. Packs the random salt and ciphertext together.
+    Returns: Single line 'DEVPULSE-v1P:<urlsafe_base64>'.
+    """
     _ensure_pynacl_available()
     if not passphrase:
         raise SecretBridgeError("Passphrase cannot be empty.")
 
+    # Generate random salt
     salt = nacl.utils.random(nacl_scrypt.SALTBYTES)
 
+    # Derive key via scrypt
     derived_key = nacl_scrypt.kdf(
         nacl.secret.SecretBox.KEY_SIZE,
         passphrase.encode("utf-8"),
@@ -333,19 +428,32 @@ def encrypt_with_passphrase(
         memlimit=nacl_scrypt.MEMLIMIT_INTERACTIVE
     )
 
+    # Encrypt using SecretBox
     secret_box = nacl.secret.SecretBox(derived_key)
     ciphertext_with_nonce = secret_box.encrypt(payload_bytes)
 
+    # Combine salt (fixed length) + ciphertext_with_nonce
     combined = salt + bytes(ciphertext_with_nonce)
     b64_output = base64.urlsafe_b64encode(combined).decode("ascii")
     return f"{CIPHERTEXT_PASSPHRASE_PREFIX}{b64_output}"
 
+
+# ==============================================================================
+# Decryption and Verification Functions
+# ==============================================================================
 
 def decrypt_message(
     message_token: str,
     passphrase: Optional[str] = None,
     config_dir: Optional[Path] = None
 ) -> Dict[str, Any]:
+    """
+    Inspects the prefix of the message token and decrypts it:
+    - DEVPULSE-v1: Decrypts using own private key with SealedBox.
+    - DEVPULSE-v1P: Decrypts using passphrase via Scrypt + SecretBox.
+    - Enforces soft-expiry check on UTC timestamp.
+    Returns: Dict containing payload fields (filename, content, created_at, sender).
+    """
     _ensure_pynacl_available()
     cleaned = message_token.strip()
 
@@ -377,7 +485,7 @@ def decrypt_message(
                 "This message was encrypted for a different public key, or the ciphertext was altered."
             )
 
-    else:
+    else:  # Passphrase mode
         if passphrase is None:
             raise SecretBridgeError("A passphrase is required to decrypt this message.")
 
@@ -409,11 +517,13 @@ def decrypt_message(
                 "Decryption failed. The passphrase entered is incorrect or the message was altered."
             )
 
+    # Parse and validate JSON structure
     try:
         payload = json.loads(plaintext_bytes.decode("utf-8"))
     except Exception:
         raise InvalidMessageFormatError("Decrypted content could not be parsed as SecretBridge JSON payload.")
 
+    # Check expiration date
     expires_at_str = payload.get("expires_at")
     if expires_at_str:
         try:
@@ -428,6 +538,7 @@ def decrypt_message(
         except ExpiredMessageError:
             raise
         except Exception:
+            # If date format is somehow malformed, proceed with caution
             pass
 
     return payload
@@ -438,6 +549,12 @@ def write_decrypted_file(
     out_path: Optional[Path] = None,
     force: bool = False
 ) -> Tuple[Path, bytes]:
+    """
+    Writes the decrypted file to disk with strict 600 permissions.
+    - Uses original filename from payload unless overridden by out_path.
+    - Refuses to overwrite existing files unless force=True.
+    Returns: (resolved Path, raw file bytes).
+    """
     raw_b64 = payload.get("file_content_b64", "")
     try:
         content_bytes = base64.b64decode(raw_b64)
@@ -453,6 +570,7 @@ def write_decrypted_file(
             "Use --force to overwrite it, or --out <filename> to save under a different name."
         )
 
+    # Write file securely with 600 permissions
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     with open(os.open(target_path, flags, 0o600), "wb") as f:
         f.write(content_bytes)

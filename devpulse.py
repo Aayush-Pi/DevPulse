@@ -19,10 +19,11 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-# Import the core modules for SecretBridge, FocusPulse, and ErgoGuard
+# Import the core modules for SecretBridge, FocusPulse, ErgoGuard, and AuditPulse
 import secret
 import focus
 import ergo
+import audit
 
 
 def format_error(msg: str) -> None:
@@ -44,6 +45,9 @@ def cmd_keygen(args: argparse.Namespace) -> int:
             name=args.name,
             force=args.force
         )
+        # Log key generation event to audit.db
+        audit.log_secret_event("key_generated")
+
         print("=" * 60)
         print(" DevPulse Keypair Generated Successfully")
         print("=" * 60)
@@ -126,6 +130,7 @@ def cmd_send(args: argparse.Namespace) -> int:
                 return 1
 
             token = secret.encrypt_with_passphrase(payload_bytes, pw1)
+            audit.log_secret_event("message_encrypted", mode="passphrase")
             print("\n" + "=" * 60)
             print(" SecretBridge Token (Passphrase-Protected):")
             print("=" * 60)
@@ -142,6 +147,7 @@ def cmd_send(args: argparse.Namespace) -> int:
             # Public-key mode
             recipient_pub, recipient_fp = secret.parse_public_key_input(args.to)
             token = secret.encrypt_for_public_key(payload_bytes, recipient_pub)
+            audit.log_secret_event("message_encrypted", mode="public_key")
 
             print("\n" + "=" * 60)
             print(" SecretBridge Token (Public-Key Encrypted):")
@@ -202,8 +208,12 @@ def cmd_open(args: argparse.Namespace) -> int:
             print("\nOperation cancelled.")
             return 1
 
+    mode = "passphrase" if token.startswith(secret.CIPHERTEXT_PASSPHRASE_PREFIX) else "public_key" if token.startswith(secret.CIPHERTEXT_PUBLIC_PREFIX) else None
+
     try:
         payload = secret.decrypt_message(token, passphrase=passphrase)
+        # Log successful decryption
+        audit.log_secret_event("message_decrypted", mode=mode)
 
         # Print sender context and unverified status
         sender = payload.get("sender_name", "Anonymous")
@@ -236,6 +246,14 @@ def cmd_open(args: argparse.Namespace) -> int:
             print()
             return 0
 
+    except secret.ExpiredMessageError as e:
+        audit.log_secret_event("message_expired", mode=mode)
+        format_error(str(e))
+        return 1
+    except secret.DecryptionFailedError as e:
+        audit.log_secret_event("decrypt_failed", mode=mode)
+        format_error(str(e))
+        return 1
     except secret.SecretBridgeError as e:
         format_error(str(e))
         return 1
@@ -321,6 +339,75 @@ def cmd_ergo_selftest(args: argparse.Namespace) -> int:
         return ergo.run_ergo_selftest()
     except Exception as e:
         format_error(f"ErgoGuard self-test failed to execute: {e}")
+        return 1
+
+
+# ==============================================================================
+# Command Handler: audit (AuditPulse)
+# ==============================================================================
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    """Handles 'devpulse audit' report generation, verification, and self-test."""
+    if args.selftest:
+        return audit.run_audit_selftest()
+
+    if args.verify:
+        verify_path = Path(args.verify)
+        try:
+            is_valid, stored, computed = audit.verify_audit_report(verify_path)
+            if is_valid:
+                print("=" * 65)
+                print(f" DevPulse AuditPulse Verification: VALID [PASS]")
+                print("=" * 65)
+                print(f"File Verified    : {verify_path}")
+                print(f"SHA-256 Digest   : {stored}")
+                print("Status           : Integrity verified. The file has not been altered.")
+                print("=" * 65)
+                return 0
+            else:
+                print("=" * 65)
+                print(f" DevPulse AuditPulse Verification: TAMPERED [FAIL]")
+                print("=" * 65)
+                print(f"File Verified    : {verify_path}")
+                print(f"Stored Digest    : {stored}")
+                print(f"Computed Digest  : {computed}")
+                print("Status           : File content does not match checksum. Modifications detected!")
+                print("=" * 65)
+                return 1
+        except Exception as e:
+            format_error(f"Failed to verify report: {e}")
+            return 1
+
+    # Generate and save report
+    try:
+        report, ergo_table, ergo_cols = audit.generate_audit_report(since_days=args.since_days)
+        out_path = Path(args.out)
+        saved_path = audit.write_audit_report(report, out_path)
+
+        # Print short readable summary to the terminal
+        sb = report["secretbridge"]
+        fp = report["focuspulse"]
+        eg = report["ergoguard"]
+
+        print("=" * 65)
+        print(f" DevPulse AuditPulse Report Generated (Period: Last {args.since_days} Days)")
+        print("=" * 65)
+        print(f"Report File       : {saved_path} (mode 600 - user rw only)")
+        print(f"Device Hostname   : {report['device_hostname']}")
+        print(f"Integrity Checksum: {report['integrity']}")
+        if ergo_table:
+            cols_str = ", ".join(ergo_cols) if ergo_cols else "none"
+            print(f"Introspected Ergo : Table '{ergo_table}' (Columns: {cols_str})")
+        print("-" * 65)
+        print(f"SecretBridge : {sb['total_events']} events logged")
+        print(f"FocusPulse   : {fp['focus_seconds']}s focus | {fp['distraction_seconds']}s distraction | Score: {fp['focus_score_percent']}% | {fp['window_switch_count']} switches")
+        print(f"ErgoGuard    : {eg['total_breaks']} breaks prompted | {eg['by_event_type'].get('rest_detected', 0)} rests | {eg['by_event_type'].get('commit_detected', 0)} commits")
+        print("-" * 65)
+        print("Privacy Guarantee: No window titles, keystrokes, contents, or keys stored.")
+        print("=" * 65)
+        return 0
+    except Exception as e:
+        format_error(f"Failed to compile audit report: {e}")
         return 1
 
 
@@ -527,6 +614,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_ergo_selftest = ergo_subparsers.add_parser("selftest", help="Run offline unit tests for ergonomic break state logic")
     p_ergo_selftest.set_defaults(func=cmd_ergo_selftest)
+
+    # 8. audit
+    parser_audit = subparsers.add_parser("audit", help="AuditPulse privacy report, checksum verification, and test suite")
+    parser_audit.add_argument("--out", default="audit_report.json", help="Output file path (default: audit_report.json)")
+    parser_audit.add_argument("--since-days", type=int, default=7, help="Lookback period in days (default: 7)")
+    parser_audit.add_argument("--verify", help="Verify the integrity SHA-256 checksum of an existing report file")
+    parser_audit.add_argument("--selftest", action="store_true", help="Run automated isolated audit self-test suite")
+    parser_audit.set_defaults(func=cmd_audit)
 
     return parser
 
