@@ -412,6 +412,27 @@ def cmd_audit(args: argparse.Namespace) -> int:
 
 
 # ==============================================================================
+# Command Handler: gui (PyQt6 Desktop Interface)
+# ==============================================================================
+
+def cmd_gui(args: argparse.Namespace) -> int:
+    """Launches the DevPulse PyQt6 desktop graphical interface."""
+    try:
+        import gui
+        return gui.main()
+    except ImportError as e:
+        format_error(
+            "PyQt6 is not installed.\n"
+            "On Debian 13 (Trixie), please install it via apt:\n"
+            "  sudo apt update && sudo apt install -y python3-pyqt6"
+        )
+        return 1
+    except Exception as e:
+        format_error(f"Failed to launch GUI: {e}")
+        return 1
+
+
+# ==============================================================================
 # Command Handler: selftest
 # ==============================================================================
 
@@ -622,6 +643,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser_audit.add_argument("--verify", help="Verify the integrity SHA-256 checksum of an existing report file")
     parser_audit.add_argument("--selftest", action="store_true", help="Run automated isolated audit self-test suite")
     parser_audit.set_defaults(func=cmd_audit)
+
+    # 9. gui
+    parser_gui = subparsers.add_parser("gui", help="Launch the DevPulse PyQt6 desktop graphical interface")
+    parser_gui.set_defaults(func=cmd_gui)
 
     return parser
 

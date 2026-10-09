@@ -576,3 +576,6 @@ def write_decrypted_file(
         f.write(content_bytes)
 
     return target_path, content_bytes
+def format_public_key(public_key) -> str:
+    """Turn a public key into the shareable one-line DEVPULSE-PUB-v1:<base64> string."""
+    return f"{PUBKEY_PREFIX}{base64.b64encode(bytes(public_key)).decode('ascii')}"
