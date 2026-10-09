@@ -19,14 +19,25 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+# Import the core crypto logic from secret.py and focus logic from focus.py
 import secret
+import focus
 
 
 def format_error(msg: str) -> None:
+    """Prints a clear, friendly error message to standard error without tracebacks."""
     sys.stderr.write(f"\n[DevPulse Error] {msg}\n\n")
 
 
+# ==============================================================================
+# Command Handler: keygen
+# ==============================================================================
+
 def cmd_keygen(args: argparse.Namespace) -> int:
+    """
+    Generates a new personal Curve25519 keypair and creates ~/.config/devpulse.
+    Saves keys with strict permissions and outputs the public key and fingerprint.
+    """
     try:
         pub_str, fingerprint, priv_path, pub_path = secret.generate_keypair(
             name=args.name,
@@ -51,7 +62,16 @@ def cmd_keygen(args: argparse.Namespace) -> int:
         return 1
 
 
+# ==============================================================================
+# Command Handler: fingerprint
+# ==============================================================================
+
 def cmd_fingerprint(args: argparse.Namespace) -> int:
+    """
+    Displays the fingerprint of either:
+    - The user's own configured public key (if --key is omitted), or
+    - A colleague's public key (string or file) to verify identity out-of-band.
+    """
     try:
         if args.key:
             _, fingerprint = secret.parse_public_key_input(args.key)
@@ -71,13 +91,19 @@ def cmd_fingerprint(args: argparse.Namespace) -> int:
         return 1
 
 
+# ==============================================================================
+# Command Handler: send
+# ==============================================================================
+
 def cmd_send(args: argparse.Namespace) -> int:
+    """
+    Packages and encrypts a file.
+    Supports either:
+    - Asymmetric mode: --to <recipient public key or file>
+    - Symmetric mode: --passphrase
+    """
     file_path = Path(args.file)
     sender_name = secret.load_sender_name()
-
-    if args.expires_hours is not None and args.expires_hours <= 0:
-        format_error("--expires-hours must be a positive number (e.g. 1 or 0.5).")
-        return 1
 
     try:
         payload_bytes = secret.build_payload(
@@ -87,6 +113,7 @@ def cmd_send(args: argparse.Namespace) -> int:
         )
 
         if args.passphrase:
+            # Passphrase mode
             print(f"Encrypting '{file_path.name}' with passphrase protection...")
             pw1 = getpass.getpass("Enter secret passphrase: ")
             if not pw1:
@@ -111,6 +138,7 @@ def cmd_send(args: argparse.Namespace) -> int:
             return 0
 
         elif args.to:
+            # Public-key mode
             recipient_pub, recipient_fp = secret.parse_public_key_input(args.to)
             token = secret.encrypt_for_public_key(payload_bytes, recipient_pub)
 
@@ -138,9 +166,18 @@ def cmd_send(args: argparse.Namespace) -> int:
         return 1
 
 
+# ==============================================================================
+# Command Handler: open
+# ==============================================================================
+
 def cmd_open(args: argparse.Namespace) -> int:
+    """
+    Decrypts an incoming SecretBridge token.
+    Reads token from --text, piped stdin, or an interactive prompt.
+    """
     token = args.text
 
+    # If --text wasn't provided, read from stdin or prompt the user
     if not token:
         if not sys.stdin.isatty():
             token = sys.stdin.read().strip()
@@ -155,6 +192,7 @@ def cmd_open(args: argparse.Namespace) -> int:
         format_error("No message token was provided.")
         return 1
 
+    # Check prefix to prompt for passphrase if needed
     passphrase = None
     if token.startswith(secret.CIPHERTEXT_PASSPHRASE_PREFIX):
         try:
@@ -166,6 +204,7 @@ def cmd_open(args: argparse.Namespace) -> int:
     try:
         payload = secret.decrypt_message(token, passphrase=passphrase)
 
+        # Print sender context and unverified status
         sender = payload.get("sender_name", "Anonymous")
         created = payload.get("created_at", "Unknown")
         orig_filename = payload.get("filename", "unnamed.env")
@@ -177,6 +216,7 @@ def cmd_open(args: argparse.Namespace) -> int:
         print("-" * 50)
 
         if args.print:
+            # Print file contents directly to terminal
             raw_b64 = payload.get("file_content_b64", "")
             import base64
             content = base64.b64decode(raw_b64).decode("utf-8", errors="replace")
@@ -187,10 +227,11 @@ def cmd_open(args: argparse.Namespace) -> int:
             print("--- END FILE CONTENT ---\n")
             return 0
         else:
+            # Write securely to disk
             out_path = Path(args.out) if args.out else None
             saved_path, _ = secret.write_decrypted_file(payload, out_path=out_path, force=args.force)
             print(f"[+] Successfully decrypted and saved to: {saved_path}")
-            print("    File permissions set to 600 (owner read/write only).")
+            print(f"    File permissions set to 600 (owner read/write only).")
             print()
             return 0
 
@@ -202,7 +243,53 @@ def cmd_open(args: argparse.Namespace) -> int:
         return 1
 
 
+# ==============================================================================
+# Command Handlers: focus (FocusPulse subcommands)
+# ==============================================================================
+
+def cmd_focus_start(args: argparse.Namespace) -> int:
+    """Starts the FocusPulse real-time window tracking daemon."""
+    try:
+        focus.run_focus_tracker()
+        return 0
+    except KeyboardInterrupt:
+        print("\nFocusPulse stopped.")
+        return 0
+    except Exception as e:
+        format_error(f"FocusPulse encountered an error: {e}")
+        return 1
+
+
+def cmd_focus_summary(args: argparse.Namespace) -> int:
+    """Displays today's focus metrics, distraction time, and top apps."""
+    try:
+        focus.print_summary()
+        return 0
+    except Exception as e:
+        format_error(f"Could not load focus summary: {e}")
+        return 1
+
+
+def cmd_focus_selftest(args: argparse.Namespace) -> int:
+    """Runs the offline unit test suite for window classification rules."""
+    try:
+        return focus.run_focus_selftest()
+    except Exception as e:
+        format_error(f"Self-test failed to execute: {e}")
+        return 1
+
+
+# ==============================================================================
+# Command Handler: selftest
+# ==============================================================================
+
 def cmd_selftest(args: argparse.Namespace) -> int:
+    """
+    Executes a comprehensive, 100% offline self-test.
+    Creates temporary folders and dummy .env files, tests both public-key and
+    passphrase workflows, and verifies output byte-for-byte without modifying
+    the user's real ~/.config/devpulse keys.
+    """
     print("=" * 60)
     print(" Running DevPulse / SecretBridge Self-Test Suite...")
     print("=" * 60)
@@ -214,6 +301,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         work_dir = tmp_path / "workspace"
         work_dir.mkdir()
 
+        # Step 1: Create dummy .env file
         dummy_env = work_dir / ".env.test"
         dummy_content = (
             b"# Dummy configuration for SecretBridge selftest\n"
@@ -226,6 +314,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         tests_passed = 0
         total_tests = 4
 
+        # Test 1: Keygen for Alice and Bob
         print("\n[Test 1/4] Key Generation & Permissions Check...")
         try:
             alice_pub, alice_fp, _, _ = secret.generate_keypair("Alice", config_dir=alice_home)
@@ -240,6 +329,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         except Exception as e:
             print(f"  Result: FAIL ({e})")
 
+        # Test 2: Public-key SealedBox round-trip (Bob sends to Alice)
         print("\n[Test 2/4] Public-Key (SealedBox) Round-Trip...")
         try:
             payload = secret.build_payload(dummy_env, "Bob")
@@ -247,6 +337,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             token = secret.encrypt_for_public_key(payload, parsed_alice_pub)
 
             assert token.startswith("DEVPULSE-v1:")
+            # Alice decrypts
             decrypted_payload = secret.decrypt_message(token, config_dir=alice_home)
             out_file = work_dir / "alice_received.env"
             saved_path, content = secret.write_decrypted_file(decrypted_payload, out_path=out_file)
@@ -259,6 +350,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         except Exception as e:
             print(f"  Result: FAIL ({e})")
 
+        # Test 3: Passphrase Scrypt + SecretBox round-trip
         print("\n[Test 3/4] Passphrase (Scrypt + SecretBox) Round-Trip...")
         try:
             test_pw = "correct-horse-battery-staple-42"
@@ -266,11 +358,13 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             p_token = secret.encrypt_with_passphrase(payload, test_pw)
 
             assert p_token.startswith("DEVPULSE-v1P:")
+            # Decrypt with correct passphrase
             decrypted_p = secret.decrypt_message(p_token, passphrase=test_pw)
             out_pw_file = work_dir / "decrypted_pw.env"
             _, content_pw = secret.write_decrypted_file(decrypted_p, out_path=out_pw_file)
             assert content_pw == dummy_content
 
+            # Verify that wrong passphrase fails cleanly
             wrong_failed = False
             try:
                 secret.decrypt_message(p_token, passphrase="wrong-passphrase")
@@ -284,8 +378,10 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         except Exception as e:
             print(f"  Result: FAIL ({e})")
 
+        # Test 4: Expired message rejection
         print("\n[Test 4/4] Expiration Safety Check...")
         try:
+            # Build payload with negative expiration (already expired)
             payload_expired = secret.build_payload(dummy_env, "Alice", expires_hours=-1.0)
             exp_token = secret.encrypt_with_passphrase(payload_expired, "pw123")
             expired_rejected = False
@@ -313,7 +409,12 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         return 1
 
 
+# ==============================================================================
+# CLI Argument Parser Setup
+# ==============================================================================
+
 def build_parser() -> argparse.ArgumentParser:
+    """Constructs the command-line argument parser for DevPulse."""
     parser = argparse.ArgumentParser(
         prog="devpulse",
         description="DevPulse / SecretBridge: Encrypt and share .env files securely over chat."
@@ -321,15 +422,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", required=True, help="Available subcommands")
 
+    # 1. keygen
     parser_keygen = subparsers.add_parser("keygen", help="Generate a new Curve25519 keypair")
     parser_keygen.add_argument("--name", required=True, help="Your name or handle (e.g. Alice)")
     parser_keygen.add_argument("--force", action="store_true", help="Overwrite existing keys")
     parser_keygen.set_defaults(func=cmd_keygen)
 
+    # 2. fingerprint
     parser_fp = subparsers.add_parser("fingerprint", help="Show public key fingerprint")
     parser_fp.add_argument("--key", help="Public key string or file to inspect (default: own key)")
     parser_fp.set_defaults(func=cmd_fingerprint)
 
+    # 3. send
     parser_send = subparsers.add_parser("send", help="Encrypt a file for secure chat delivery")
     parser_send.add_argument("file", help="Path to the .env or config file to encrypt (max 64 KB)")
     send_mode = parser_send.add_mutually_exclusive_group(required=True)
@@ -338,6 +442,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser_send.add_argument("--expires-hours", type=float, default=None, help="Set message expiration in hours")
     parser_send.set_defaults(func=cmd_send)
 
+    # 4. open
     parser_open = subparsers.add_parser("open", help="Decrypt and view/save a received SecretBridge message")
     parser_open.add_argument("--text", help="The raw DEVPULSE-v1:... or DEVPULSE-v1P:... message string")
     parser_open.add_argument("--out", help="Custom destination filename (default: original filename)")
@@ -345,13 +450,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser_open.add_argument("--force", action="store_true", help="Overwrite existing file on disk")
     parser_open.set_defaults(func=cmd_open)
 
+    # 5. selftest
     parser_selftest = subparsers.add_parser("selftest", help="Run automated offline cryptographic test suite")
     parser_selftest.set_defaults(func=cmd_selftest)
+
+    # 6. focus
+    parser_focus = subparsers.add_parser("focus", help="FocusPulse window activity and distraction tracker")
+    focus_subparsers = parser_focus.add_subparsers(dest="focus_command", required=True, help="Focus subcommands")
+
+    p_focus_start = focus_subparsers.add_parser("start", help="Start real-time window tracking and distraction alerts")
+    p_focus_start.set_defaults(func=cmd_focus_start)
+
+    p_focus_summary = focus_subparsers.add_parser("summary", help="Show today's focus metrics and top applications")
+    p_focus_summary.set_defaults(func=cmd_focus_summary)
+
+    p_focus_selftest = focus_subparsers.add_parser("selftest", help="Run offline unit tests for window classification rules")
+    p_focus_selftest.set_defaults(func=cmd_focus_selftest)
 
     return parser
 
 
 def main() -> None:
+    """Main CLI entrypoint."""
     parser = build_parser()
     args = parser.parse_args()
     try:
