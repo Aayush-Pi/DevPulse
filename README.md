@@ -3,7 +3,7 @@
 
 **One offline Linux tool for three developer problems: leaking secrets in chat, losing focus, and ignoring breaks.**
 
-> Status: **v0.1.0-alpha**. Built for a college ideathon. Tested on Debian 13 (trixie), KDE Plasma 6.3, Wayland only.
+> Status: **v0.1.0-alpha**. Built for a college ideathon. Tested on Debian 13 (trixie), KDE Plasma 6.3, Wayland only. Tested on Windows and Mac OS - only SecretBridge and audit-report works on systems other than kde plasma wayland.
 
 ## What it does
 
