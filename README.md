@@ -31,6 +31,11 @@ sudo apt install rustup pkg-config libdbus-1-dev
 rustup default stable
 cargo install kdotool
 ```
+## Windows (partial):
+```
+ pip install -r requirements.txt
+```
+ then SecretBridge and audit work. FocusPulse and ErgoGuard are Linux-only.
 
 ## Quick start
 
