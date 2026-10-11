@@ -20,7 +20,7 @@ No network calls. No telemetry. No window titles, keystrokes, file contents or k
 
 ```
 sudo apt install python3-nacl python3-yaml python3-pyqt6 swayidle libnotify-bin
-git clone https://github.com/[you]/devpulse.git
+git clone https://github.com/Aayush-Pi/devpulse.git
 cd devpulse
 ```
 
